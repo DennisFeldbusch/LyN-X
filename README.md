@@ -1,4 +1,7 @@
 # LyN-X
+<p align="center">
+<img width="229" height="262" alt="image" src="https://github.com/user-attachments/assets/c1c1605a-c216-4577-9846-087f3cfa292e" />
+</p>
 
 Fast, purely-static URL/endpoint extraction from JavaScript. Accepts a `.js` file, an HTML file, or
 a URL, and reconstructs the URLs each network sink would request, while resolving variables, concatenation,
