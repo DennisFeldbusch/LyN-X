@@ -160,17 +160,34 @@ resolveMemberAssignment(name, scope, pos, overrides, runtimeEnv) {
     if (!assignments || assignments.length === 0) {
         return null;
     }
-    const latest = assignments[assignments.length - 1];
-    if (!latest) {
+    // Scope filter: only honor an assignment whose base variable binds to the SAME declaration the
+    // read's base variable binds to (so an IIFE-internal `s.params.url = …` never resolves an outer
+    // read of `s.params.url`). Records without scope metadata are accepted (back-compat).
+    const readBase = String(name).split(".")[0];
+    const rScopeId = this.bindingScopeId(scope, readBase, pos);
+    const compatible = assignments.filter((a) => {
+        if (!a.base) return true;
+        return this.bindingScopeId(a.scope || scope, a.base, a.pos != null ? a.pos : pos) === rScopeId;
+    });
+    if (compatible.length === 0) {
         return null;
     }
+    const latest = compatible[compatible.length - 1];
     if (latest.value) {
         return [latest.value];
     }
     if (latest.node) {
-        return this.resolveExpression(latest.node, scope, pos, overrides, runtimeEnv);
+        return this.resolveExpression(latest.node, latest.scope || scope, latest.pos != null ? latest.pos : pos, overrides, runtimeEnv);
     }
     return null;
+}
+,
+
+// id of the scope where `base` binds when read from `scope` (null if free/undeclared) — used to
+// decide whether a member assignment and a member read touch the SAME object binding.
+bindingScopeId(scope, base, pos) {
+    const found = this.findLatestDef(scope, base, pos);
+    return found ? found.scope.id : null;
 }
 ,
 
@@ -1201,7 +1218,21 @@ resolveAsyncGenerator(node, scope, pos, overrides, runtimeEnv) {
 }
 ,
 
+// Depth-guarded entry: pathological/obfuscated code can drive the mutual recursion
+// (resolveExpression <-> resolveCallExpression / resolveDeepObjectProperty) past the JS stack
+// limit. Bail gracefully on this subexpression instead of crashing; other sinks still resolve.
 resolveExpression(node, scope, pos, overrides, runtimeEnv) {
+    this._resolveDepth = (this._resolveDepth || 0) + 1;
+    try {
+        if (this._resolveDepth > 100) return [""];
+        return this._resolveExpressionInner(node, scope, pos, overrides, runtimeEnv);
+    } finally {
+        this._resolveDepth--;
+    }
+}
+,
+
+_resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
     if (!node) return [""];
     switch (node.type) {
         case "Literal": return [String(node.value)];

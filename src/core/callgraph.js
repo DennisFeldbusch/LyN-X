@@ -6,8 +6,10 @@ recordInterproceduralSink(entry, overrides, runtimeEnv) {
     const values = this.resolveExpression(arg, entry.scope, pos, overrides || new Map(), runtimeEnv);
     values.forEach(val => {
         if (!val) return;
-        const line = entry.node.loc && entry.node.loc.start ? entry.node.loc.start.line : 0;
-        this.results.add(`${line}|${entry.sinkInfo.name}|${val}`);
+        const loc = entry.node.loc && entry.node.loc.start ? entry.node.loc.start : null;
+        const line = loc ? loc.line : 0;
+        const col = loc ? loc.column + 1 : 0;                 // 1-based char position of the sink
+        this.results.add(`${line}|${col}|${entry.sinkInfo.name}|${val}`);
     });
 }
 ,

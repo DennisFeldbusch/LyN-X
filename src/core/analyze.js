@@ -78,8 +78,10 @@ recordResolvedSinkValues(entry, overrides) {
             return;
         }
         
-        const line = node.loc && node.loc.start ? node.loc.start.line : 0;
-        this.results.add(`${line}|${sinkInfo.name}|${val}`);
+        const loc = node.loc && node.loc.start ? node.loc.start : null;
+        const line = loc ? loc.line : 0;
+        const col = loc ? loc.column + 1 : 0;                 // 1-based char position of the sink
+        this.results.add(`${line}|${col}|${sinkInfo.name}|${val}`);
     });
 }
 ,
@@ -104,10 +106,11 @@ isExcludedUrl(url) {
 getSortedResultRows() {
     const rows = [...this.results]
         .map(entry => {
-            const [line, sink, url] = entry.split("|");
-            return { line: Number(line), sink, url };
+            const parts = entry.split("|");
+            // format: line|col|sink|url  (url may itself contain "|", so rejoin the remainder)
+            return { line: Number(parts[0]), col: Number(parts[1]), sink: parts[2], url: parts.slice(3).join("|") };
         })
-        .sort((a, b) => a.line - b.line || a.sink.localeCompare(b.sink) || a.url.localeCompare(b.url));
+        .sort((a, b) => a.line - b.line || a.col - b.col || a.sink.localeCompare(b.sink) || a.url.localeCompare(b.url));
     
     // Fallback URL substitution is disabled for now - showing unresolved URLs is more informative
     // than substituting them with potentially wrong extracted URLs
@@ -223,30 +226,28 @@ resolveVariablePlaceholders(url) {
         const varName = match[1];
         let resolved = null;
         
+        // This is a POST-HOC, scope-less pass over the final URL string, so it can only safely draw on
+        // assignments to program-scope GLOBALS — an outer read may legitimately reference those, but
+        // never a function/IIFE-local object (which would be a cross-scope false positive, e.g. an
+        // IIFE-internal `config.url` bleeding into an unrelated `foo.url`).
+        const globalsOf = (key) => (this.memberAssignments.get(key) || []).filter((a) => a.global);
+
         // Try exact match first (e.g., "l.p")
-        if (this.memberAssignments.has(varName)) {
-            const assignments = this.memberAssignments.get(varName);
-            if (assignments && assignments.length > 0) {
-                const latest = assignments[assignments.length - 1];
-                if (latest && latest.value) {
-                    resolved = latest.value;
-                }
-            }
+        const exact = globalsOf(varName);
+        if (exact.length > 0 && exact[exact.length - 1].value) {
+            resolved = exact[exact.length - 1].value;
         }
-        
+
         // If no exact match and this is a member expression (contains a dot),
         // try property-only match (e.g., ".p") to handle variable name variations
         if (!resolved && varName.includes(".")) {
             const propPart = "." + varName.split(".").pop(); // e.g., "l.p" -> ".p"
-            if (this.memberAssignments.has(propPart)) {
-                const assignments = this.memberAssignments.get(propPart);
-                if (assignments && assignments.length > 0) {
-                    // Prefer non-general assignments, fall back to general ones
-                    const nonGeneral = assignments.find(a => !a.isGeneral);
-                    const latest = nonGeneral || assignments[assignments.length - 1];
-                    if (latest && latest.value) {
-                        resolved = latest.value;
-                    }
+            const general = globalsOf(propPart);
+            if (general.length > 0) {
+                // Prefer non-general assignments, fall back to general ones
+                const latest = general.find((a) => !a.isGeneral) || general[general.length - 1];
+                if (latest && latest.value) {
+                    resolved = latest.value;
                 }
             }
         }

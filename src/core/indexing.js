@@ -421,18 +421,24 @@ index() {
                 : this.getName(node.left.property);
             const objName = this.getName(node.left.object);
             
-            // Track member assignments so the resolver can follow aliases like a.p = t
+            // Track member assignments so the resolver can follow aliases like a.p = t.
+            // Each record carries the assignment's lexical `scope`, its `base` variable (root of the
+            // LHS member chain), and `global` (assigned at program scope) so resolution can respect
+            // scope (see resolveMemberAssignment / resolveVariablePlaceholders) instead of matching
+            // by name across unrelated scopes.
             if (objName && propName && node.right) {
+                let baseNode = node.left;
+                while (baseNode && baseNode.type === "MemberExpression") baseNode = baseNode.object;
+                const base = baseNode && baseNode.type === "Identifier" ? baseNode.name : null;
+                const meta = { scope, base, global: !scope.parent };
+                const value = node.right.type === "Literal" && typeof node.right.value === "string" ? node.right.value : null;
+
                 const memberKey = `${objName}.${propName}`;
                 if (!this.memberAssignments.has(memberKey)) {
                     this.memberAssignments.set(memberKey, []);
                 }
-                this.memberAssignments.get(memberKey).push({
-                    value: node.right.type === "Literal" && typeof node.right.value === "string" ? node.right.value : null,
-                    node: node.right,
-                    pos: node.start || 0
-                });
-                
+                this.memberAssignments.get(memberKey).push({ value, node: node.right, pos: node.start || 0, ...meta });
+
                 // Also store by property name alone for general lookup (e.g., any ".p" assignment)
                 // This allows resolution of {VAR:l.p}, {VAR:b.p}, etc. regardless of variable name
                 const propKey = `.${propName}`;
@@ -442,12 +448,7 @@ index() {
                 // Only add if not already there (prefer explicit var.prop over just .prop)
                 const existing = this.memberAssignments.get(propKey);
                 if (!existing.some(a => a.value === node.right.value)) {
-                    this.memberAssignments.get(propKey).push({
-                        value: node.right.type === "Literal" && typeof node.right.value === "string" ? node.right.value : null,
-                        node: node.right,
-                        pos: node.start || 0,
-                        isGeneral: true
-                    });
+                    this.memberAssignments.get(propKey).push({ value, node: node.right, pos: node.start || 0, isGeneral: true, ...meta });
                 }
                 
                 if (process.env.DEBUG_MEMBER) {
