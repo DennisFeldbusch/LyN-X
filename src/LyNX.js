@@ -8,8 +8,10 @@ const resolve = require("./core/resolve");
 const analyze = require("./core/analyze");
 
 class LyNX {
-    constructor(filePath) {
-        this.code = fs.readFileSync(filePath, "utf8");
+    constructor(input) {
+        // Accept a file path (string) or in-memory source ({ code }) — the latter is used for
+        // the concatenated HTML script bundle, so the analysis flow itself is untouched.
+        this.code = typeof input === "string" ? fs.readFileSync(input, "utf8") : input.code;
         this.ast = this.parseCode(this.code);
         this.results = new Set();
         this.maxCombos = 8000;
