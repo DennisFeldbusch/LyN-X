@@ -10,6 +10,18 @@ permissions:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: bun-linux-x64
+            output: lynx-linux-x64
+          - target: bun-darwin-arm64
+            output: lynx-macos-arm64
+          - target: bun-darwin-x64
+            output: lynx-macos-x64
+          - target: bun-windows-x64
+            output: lynx-windows-x64.exe
+          
 
     steps:
       - name: Checkout Repository
@@ -25,13 +37,12 @@ jobs:
 
       - name: Build Standalone Binary
         run: |
-          echo "[*] Building standalone ./lynx (linux-x64) ..."
-          bun build ./lyn-x.js --compile --minify --target=bun-linux-x64 --outfile lynx
-          chmod +x lynx
+          echo "[*] Building standalone ..."
+          bun build ./lyn-x.js --compile --minify --target=${{ matrix.target }} --outfile ${{ matrix.output }}
 
       - name: Upload Binary to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: lynx
+          files: ${{ matrix.output }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
