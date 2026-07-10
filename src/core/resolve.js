@@ -732,53 +732,6 @@ getMemberPropertyValue(memberExpr, scope, pos, overrides, runtimeEnv) {
 ,
 
 /**
- * Resolve Promise chain methods: .then(callback), .catch(callback), .finally(callback)
- * Extracts and analyzes the callback function to capture what values flow through the promise.
- */
-resolvePromiseChain(node, scope, pos, overrides, runtimeEnv) {
-    if (!node || !node.callee || node.callee.type !== "MemberExpression") return null;
-    const methodName = this.getMemberPropertyValue(node.callee, scope, pos, overrides, runtimeEnv);
-    if (!["then", "catch", "finally"].includes(methodName)) return null;
-    
-    // Get the promise object (the thing being chained)
-    const promiseValues = this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
-    
-    // Get the callback function (first argument for then/catch, any argument for finally)
-    const callbackArg = node.arguments && node.arguments[0];
-    if (!callbackArg) return null;
-    
-    // If callback is a function expression or arrow function, analyze its return
-    if (callbackArg.type === "FunctionExpression" || callbackArg.type === "ArrowFunctionExpression") {
-        const callbackResults = this.resolveFunctionReturn(callbackArg, scope, pos, [], runtimeEnv);
-        if (callbackResults && callbackResults.length > 0) {
-            return callbackResults.filter(v => v !== "");
-        }
-    }
-    
-    // If callback is a reference to a function, resolve that function
-    if (callbackArg.type === "Identifier") {
-        const found = this.findLatestDef(scope, callbackArg.name, pos);
-        if (found && found.def && found.def.node && 
-            (found.def.node.type === "FunctionExpression" || 
-             found.def.node.type === "FunctionDeclaration" || 
-             found.def.node.type === "ArrowFunctionExpression")) {
-            const callbackResults = this.resolveFunctionReturn(found.def.node, scope, pos, [], runtimeEnv);
-            if (callbackResults && callbackResults.length > 0) {
-                return callbackResults.filter(v => v !== "");
-            }
-        }
-    }
-    
-    // For .finally, return the promise values themselves
-    if (methodName === "finally") {
-        return promiseValues;
-    }
-    
-    return null;
-}
-,
-
-/**
  * Resolve array transformation methods: .map(fn), .filter(fn), .reduce(fn, init), .flatMap(fn), etc.
  * Extracts callback results or array elements based on method semantics.
  */
@@ -1167,49 +1120,6 @@ extractFromFunctionBody(body, scope, pos, overrides, runtimeEnv) {
                     )
                 );
                 if (filtered.length > 0) values.push(...filtered);
-            }
-        }
-    }
-    
-    return values;
-}
-,
-
-/**
- * Handle async generator functions and generator expressions
- * These wrap URLs in Promise chains with yield operators
- */
-resolveAsyncGenerator(node, scope, pos, overrides, runtimeEnv) {
-    if (!node || (node.async !== true && node.generator !== true)) return [];
-    const values = [];
-    
-    // Extract from generator body
-    if (node.body && node.body.type === "BlockStatement") {
-        for (const statement of node.body.body) {
-            if (!statement) continue;
-            
-            // yield expressions: yield x.url;
-            if (statement.type === "ExpressionStatement" && statement.expression && statement.expression.type === "YieldExpression") {
-                const resolved = this.resolveExpression(
-                    statement.expression.argument,
-                    scope,
-                    pos,
-                    overrides,
-                    runtimeEnv
-                );
-                values.push(...resolved);
-            }
-            
-            // return statements: return x.url;
-            if (statement.type === "ReturnStatement" && statement.argument) {
-                const resolved = this.resolveExpression(
-                    statement.argument,
-                    scope,
-                    pos,
-                    overrides,
-                    runtimeEnv
-                );
-                values.push(...resolved);
             }
         }
     }

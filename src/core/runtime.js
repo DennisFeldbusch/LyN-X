@@ -80,6 +80,11 @@ mergeAllRuntimeEnvs(envs) {
 
 resolveExpressionRuntime(node, env, pos=0) {
     if (!node) return [""];
+    // Depth guard (mirrors resolveExpression): deep +/||/nested chains in minified bundles would
+    // overflow this mutual recursion. Degrade to "" past the cap instead of crashing the whole file.
+    this._rtDepth = (this._rtDepth || 0) + 1;
+    if (this._rtDepth > 300) { this._rtDepth--; return [""]; }
+    try {
     switch (node.type) {
         case "Literal": return [String(node.value)];
         case "Identifier": {
@@ -310,6 +315,7 @@ resolveExpressionRuntime(node, env, pos=0) {
         }
         default: return [""];
     }
+    } finally { this._rtDepth--; }
 }
 ,
 

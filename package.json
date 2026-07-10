@@ -1,11 +1,13 @@
 {
   "name": "lyn-x",
-  "version": "2.0.0",
-  "description": "",
+  "version": "1.0.0",
+  "description": "Fast, purely-static URL/endpoint extraction from JavaScript (Acorn AST + backward taint + abstract interpretation).",
   "license": "ISC",
   "type": "commonjs",
   "main": "lyn-x.js",
-  "bin": { "lyn-x": "lyn-x.js" },
+  "bin": {
+    "lyn-x": "lyn-x.js"
+  },
   "dependencies": {
     "acorn": "^8.16.0"
   }

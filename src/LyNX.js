@@ -58,18 +58,22 @@ class LyNX {
             /^\/sys\//,
         ];
         
-        const walk = (node) => {
-            if (!node || typeof node !== "object") return;
-            
+        // Iterative traversal (explicit stack) so deeply-nested ASTs — long +/||/method chains in
+        // minified bundles — can't overflow the native call stack. Order is irrelevant (Set of URLs).
+        const stack = [this.ast];
+        while (stack.length) {
+            const node = stack.pop();
+            if (!node || typeof node !== "object") continue;
+
             // Look for string literals that are likely URLs or paths
             if (node.type === "Literal" && typeof node.value === "string") {
                 const val = node.value;
-                
+
                 // Check if it's a filesystem path (not a web URL)
                 const isFilesystemPath = NOT_WEB_PATHS.some(pattern => pattern.test(val));
                 if (isFilesystemPath) {
                     // Skip filesystem paths
-                } 
+                }
                 // Paths starting with / that are likely web resources
                 else if (val.startsWith("/") && val.length > 2 && !val.includes("(") && !val.includes(")")) {
                     urls.add(val);
@@ -87,17 +91,16 @@ class LyNX {
                     urls.add(val);
                 }
             }
-            
-            // Recurse into all properties
+
+            // Push all child nodes
             for (const key in node) {
                 if (key === "parent" || key === "loc" || key === "range") continue;
                 const child = node[key];
-                if (Array.isArray(child)) child.forEach(c => walk(c));
-                else if (typeof child === "object") walk(child);
+                if (Array.isArray(child)) { for (const c of child) if (c && typeof c === "object") stack.push(c); }
+                else if (child && typeof child === "object") stack.push(child);
             }
-        };
-        
-        walk(this.ast);
+        }
+
         return urls;
     }
 

@@ -345,7 +345,7 @@ _walkEventHandler(fnNode, scope, walk) {
         }
     });
     const body = fnNode.body && fnNode.body.type === "BlockStatement" ? fnNode.body.body : [fnNode.body];
-    body.filter(Boolean).forEach(child => walk(child, fnScope, fnNode));
+    { const b = body.filter(Boolean); for (let i = b.length - 1; i >= 0; i--) walk(b[i], fnScope, fnNode); }
 }
 ,
 
@@ -356,7 +356,13 @@ index() {
         return scope;
     };
 
-    const walk = (node, scope, parent) => {
+    const stack = [];
+    // Deferred/iterative traversal: `walk` only enqueues; `process` does the per-node work. This
+    // replaces native recursion so deeply-nested ASTs (long +/||/method chains in minified bundles)
+    // can't overflow the call stack. Children are pushed in reverse so they pop in source order —
+    // an identical pre-order DFS to the former recursion (results verified byte-identical).
+    const walk = (node, scope, parent) => { if (node && typeof node === "object") stack.push([node, scope, parent]); };
+    const visit = (node, scope, parent) => {   // NB: not named `process` — that shadows the global `process` (env checks below)
         if (!node || typeof node !== "object") return;
         this.scopeMap.set(node, scope);
         this.parentMap.set(node, parent || null);
@@ -452,7 +458,7 @@ index() {
                 }
                 
                 if (process.env.DEBUG_MEMBER) {
-                    console.error(`[INDEX] MEMBER_ASSIGN: ${memberKey} = "${node.right.value}"`);
+                    console.error(`[INDEX] MEMBER_ASSIGN: ${memberKey} = ${JSON.stringify(value)}`);
                 }
             }
             
@@ -658,7 +664,7 @@ index() {
                 });
             }
             const body = node.body && node.body.type === "BlockStatement" ? node.body.body : [node.body];
-            body.filter(Boolean).forEach(child => walk(child, fnScope, node));
+            { const b = body.filter(Boolean); for (let i = b.length - 1; i >= 0; i--) walk(b[i], fnScope, node); }
             return;
         }
 
@@ -673,20 +679,23 @@ index() {
                 }
             });
             const body = node.value.body && node.value.body.type === "BlockStatement" ? node.value.body.body : [node.value.body];
-            body.filter(Boolean).forEach(child => walk(child, fnScope, node.value));
+            { const b = body.filter(Boolean); for (let i = b.length - 1; i >= 0; i--) walk(b[i], fnScope, node.value); }
             return;
         }
 
+        const kids = [];
         for (const key in node) {
             if (key === "parent") continue;
             const child = node[key];
-            if (Array.isArray(child)) child.forEach(c => walk(c, scope, node));
-            else walk(child, scope, node);
+            if (Array.isArray(child)) { for (const c of child) kids.push(c); }
+            else kids.push(child);
         }
+        for (let i = kids.length - 1; i >= 0; i--) walk(kids[i], scope, node);   // reverse -> pop in source order
     };
 
     const rootScope = this.createScope(null);
     walk(this.ast, rootScope, null);
+    while (stack.length) { const [n, s, p] = stack.pop(); visit(n, s, p); }
 }
 ,
 
