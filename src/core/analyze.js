@@ -1,54 +1,62 @@
+const { OP_BUDGET } = require("./shared");
+
 module.exports = {
 
 /**
  * Create all combinations of concatenating elements from left and right arrays
  * Limits results to maxCombos to avoid explosion
- * 
+ *
  * Enhancement: Prioritize concrete values over placeholders
  * When both left and right have concrete values, those combinations come first.
  */
 cartesianConcat(left, right) {
     const result = [];
+    const seen = new Set();   // O(1) dedup — replaces result.includes() (was O(max^2): THE corpus hot path)
     const max = this.maxCombos || 8000;
-    
+
     if (!left || left.length === 0) left = [""];
     if (!right || right.length === 0) right = [""];
-    
+    // Over budget: skip the product (some resolvers loop cartesianConcat via reduce, with no resolver
+    // entry between calls to re-check), returning a truncated LHS so pathological files bail here too.
+    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; return left.slice(0, max); }
+
     // Helper to detect placeholder values
     const isPlaceholder = (val) => typeof val === "string" && (val.startsWith("{VAR:") || val.startsWith("{CALL:"));
-    
+    const add = (l, r) => {
+        // Charge the work budget PER COMBINATION considered — cartesian growth is the real per-file
+        // cost, and the resolvers only check this._ops at their entries (too coarse to catch it here),
+        // so counting resolver calls alone let obfuscated bundles run for minutes. Now they bail.
+        this._ops = (this._ops || 0) + 1;
+        const combined = String(l || "") + String(r || "");
+        if (!seen.has(combined)) { seen.add(combined); result.push(combined); }
+    };
+
     // Categorize values
     const leftConcrete = left.filter(v => !isPlaceholder(v));
     const rightConcrete = right.filter(v => !isPlaceholder(v));
-    
+
     // Priority 1: If both sides have concrete values, combine those first
     if (leftConcrete.length > 0 && rightConcrete.length > 0) {
         for (let l of leftConcrete) {
             if (result.length >= max) break;
             for (let r of rightConcrete) {
                 if (result.length >= max) break;
-                const combined = String(l || "") + String(r || "");
-                if (!result.includes(combined)) {
-                    result.push(combined);
-                }
+                add(l, r);
             }
         }
     }
-    
+
     // Priority 2: Full cartesian product for remaining combinations
     if (result.length < max) {
         for (let l of left) {
             if (result.length >= max) break;
             for (let r of right) {
                 if (result.length >= max) break;
-                const combined = String(l || "") + String(r || "");
-                if (!result.includes(combined)) {
-                    result.push(combined);
-                }
+                add(l, r);
             }
         }
     }
-    
+
     return result.slice(0, max);
 }
 ,

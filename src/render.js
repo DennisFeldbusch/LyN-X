@@ -138,4 +138,4 @@ function renderTable(rows, { color = true, baseHost = null, columns = process.st
   return out;
 }
 
-module.exports = { renderTable, renderRaw, colorUrl, hasSensitive, sameSite, isUrlLike };
+module.exports = { renderTable, renderRaw, isUrlLike };   // colorUrl/hasSensitive/sameSite are render-internal

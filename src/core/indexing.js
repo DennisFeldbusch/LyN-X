@@ -725,17 +725,6 @@ findPrevDef(scope, name, pos) {
     }
     return null;
 }
-,
-
-cartesianConcat(left, right) {
-    const results = new Set();
-    left.forEach(l => {
-        right.forEach(r => {
-            results.add(`${l}${r}`);
-        });
-    });
-    return [...results].slice(0, this.maxCombos);
-}
-,
+// NB: cartesianConcat lives in analyze.js (assigned last in LyNX.js, so it wins) — no duplicate here.
 
 };

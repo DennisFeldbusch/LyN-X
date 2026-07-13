@@ -1,3 +1,5 @@
+const { OP_BUDGET, collectReturns } = require("./shared");   // shared with resolve.js
+
 module.exports = {
 
 createRuntimeEnv() {
@@ -84,6 +86,8 @@ resolveExpressionRuntime(node, env, pos=0) {
     // overflow this mutual recursion. Degrade to "" past the cap instead of crashing the whole file.
     this._rtDepth = (this._rtDepth || 0) + 1;
     if (this._rtDepth > 300) { this._rtDepth--; return [""]; }
+    this._ops = (this._ops || 0) + 1;
+    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; this._rtDepth--; return [""]; }   // global-budget bail
     try {
     switch (node.type) {
         case "Literal": return [String(node.value)];
@@ -423,24 +427,10 @@ resolveFunctionReturnRuntime(fnNode, env, argNodes) {
         }
     }
     const returns = [];
-    const scan = (node) => {
-        if (!node || typeof node !== "object") return;
-        if (node.type === "ReturnStatement") {
-            returns.push(node.argument);
-            return;
-        }
-        if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") return;
-        for (const key in node) {
-            if (key === "parent") continue;
-            const child = node[key];
-            if (Array.isArray(child)) child.forEach(c => scan(c));
-            else scan(child);
-        }
-    };
     if (fnNode.type === "ArrowFunctionExpression" && fnNode.body && fnNode.body.type !== "BlockStatement") {
          returns.push(fnNode.body);
     } else {
-         scan(fnNode.body || fnNode);
+         returns.push(...collectReturns(fnNode.body || fnNode));
     }
 
     let results = [];

@@ -33,75 +33,8 @@ class LyNX {
         this.varDomains = new Map(); // Map of variable names to their resolved domain values
         this.memberAssignments = new Map(); // Track literal assignments like l.p = "/client/"
         
-        // Extract all URL-like string literals from the code for fallback resolution
-        this.urlLiterals = this.extractUrlLiterals();
-        
         // Auto-extract webpack runtime configuration from minified code
         this.extractWebpackConfig();
-    }
-
-    extractUrlLiterals() {
-        const urls = new Set();
-        
-        // Filesystem paths that are NOT web URLs
-        const NOT_WEB_PATHS = [
-            /^\/dev\//,
-            /^\/home\//,
-            /^\/tmp\//,
-            /^\/proc\//,
-            /^\/var\//,
-            /^\/etc\//,
-            /^\/usr\//,
-            /^\/bin\//,
-            /^\/sbin\//,
-            /^\/lib\//,
-            /^\/sys\//,
-        ];
-        
-        // Iterative traversal (explicit stack) so deeply-nested ASTs — long +/||/method chains in
-        // minified bundles — can't overflow the native call stack. Order is irrelevant (Set of URLs).
-        const stack = [this.ast];
-        while (stack.length) {
-            const node = stack.pop();
-            if (!node || typeof node !== "object") continue;
-
-            // Look for string literals that are likely URLs or paths
-            if (node.type === "Literal" && typeof node.value === "string") {
-                const val = node.value;
-
-                // Check if it's a filesystem path (not a web URL)
-                const isFilesystemPath = NOT_WEB_PATHS.some(pattern => pattern.test(val));
-                if (isFilesystemPath) {
-                    // Skip filesystem paths
-                }
-                // Paths starting with / that are likely web resources
-                else if (val.startsWith("/") && val.length > 2 && !val.includes("(") && !val.includes(")")) {
-                    urls.add(val);
-                }
-                // Full URLs (http/https)
-                else if (/^https?:\/\/[\w\-._~:/?#[\]@!$&'()*+,;=%]+$/.test(val)) {
-                    urls.add(val);
-                }
-                // Protocol-relative URLs
-                else if (/^\/\/[\w\-._~:/?#[\]@!$&'()*+,;=%]+$/.test(val)) {
-                    urls.add(val);
-                }
-                // UUIDs (might be used in URLs)
-                else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) {
-                    urls.add(val);
-                }
-            }
-
-            // Push all child nodes
-            for (const key in node) {
-                if (key === "parent" || key === "loc" || key === "range") continue;
-                const child = node[key];
-                if (Array.isArray(child)) { for (const c of child) if (c && typeof c === "object") stack.push(c); }
-                else if (child && typeof child === "object") stack.push(child);
-            }
-        }
-
-        return urls;
     }
 
     parseCode(code) {

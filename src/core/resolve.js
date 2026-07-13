@@ -1,6 +1,9 @@
 // Debug flag for tracing variable resolution
 const DEBUG_VAR = process.env.DEBUG_VAR === '1';
 
+// OP_BUDGET (global per-file resolver work cap, via this._ops) + collectReturns are shared with runtime.js.
+const { OP_BUDGET, collectReturns } = require("./shared");
+
 // Known functions that return URLs or URL-like values
 const URL_RETURNING_FUNCTIONS = {
     'buildUri': true,
@@ -191,45 +194,6 @@ bindingScopeId(scope, base, pos) {
 }
 ,
 
-/**
- * Try to extract any concrete value from an identifier's definition,
- * even if not fully resolvable. Used as fallback for better recall.
- */
-extractConcreteValuesFromIdentifier(name, scope, pos, overrides, runtimeEnv) {
-    const found = this.findLatestDef(scope, name, pos);
-    if (!found || !found.def || !found.def.node) return [];
-    const node = found.def.node;
-    
-    // Try direct expression resolution first
-    let results = [];
-    try {
-        const values = this.resolveExpression(node, found.scope, found.def.pos, overrides, runtimeEnv);
-        // Filter out pure placeholders
-        results = values.filter(v => v && typeof v === "string" && v.length > 0 && !v.startsWith("{VAR:"));
-    } catch (e) {
-        // Silently ignore resolution errors
-    }
-    
-    // If resolution resulted in placeholders, try to extract patterns
-    if (results.length === 0 && node.type === "MemberExpression") {
-        // Try to get the full member chain as a string representation
-        const memberChain = this.getName(node);
-        if (memberChain && memberChain.length > 0) {
-            results.push(`{VAR:${memberChain}}`);
-        }
-    }
-    
-    if (results.length === 0 && node.type === "CallExpression") {
-        // For function calls, at least capture the function name
-        const calleeName = this.getName(node.callee);
-        if (calleeName) {
-            results.push(`{CALL:${calleeName}}`);
-        }
-    }
-    
-    return results;
-}
-,
 
 resolveTemplateLiteral(node, scope, pos, overrides, runtimeEnv) {
     const parts = [];
@@ -330,6 +294,13 @@ _findObjectExprNode(node, scope, pos) {
         if (DEBUG_VAR) console.error(`[OBJECT] No node provided`);
         return null;
     }
+    // Depth guard (mirrors resolveExpression): alias/member chains in obfuscated or cyclic code can
+    // drive this self-recursion past the JS stack. Degrade to null (unresolved) past the cap.
+    this._foenDepth = (this._foenDepth || 0) + 1;
+    if (this._foenDepth > 200) { this._foenDepth--; return null; }
+    this._ops = (this._ops || 0) + 1;
+    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; this._foenDepth--; return null; }   // global-budget bail
+    try {
     if (node.type === "ObjectExpression") {
         if (DEBUG_VAR) console.error(`[OBJECT] Direct ObjectExpression found`);
         return { objectNode: node, defScope: scope, defPos: pos };
@@ -413,6 +384,7 @@ _findObjectExprNode(node, scope, pos) {
     }
     if (DEBUG_VAR) console.error(`[OBJECT] Node type not handled: ${node.type}`);
     return null;
+    } finally { this._foenDepth--; }
 }
 ,
 
@@ -561,24 +533,10 @@ extractObjectMapKeys(node, paramName) {
 
 extractConditionalMap(node, paramName) {
     const returns = [];
-    const scan = (n) => {
-        if (!n || typeof n !== "object") return;
-        if (n.type === "ReturnStatement") {
-            returns.push(n.argument);
-            return;
-        }
-        if (n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression") return;
-        for (const key in n) {
-            if (key === "parent") continue;
-            const child = n[key];
-            if (Array.isArray(child)) child.forEach(c => scan(c));
-            else scan(child);
-        }
-    };
     if (node && node.type === "ArrowFunctionExpression" && node.body && node.body.type !== "BlockStatement") {
         returns.push(node.body);
     } else {
-        scan(node);
+        returns.push(...collectReturns(node));
     }
     if (returns.length !== 1) return null;
     let current = returns[0];
@@ -619,6 +577,11 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
         .join(",");
     const fnStart = typeof fnNode.start === "number" ? fnNode.start : "na";
     const guardKey = `${fnStart}|${pos || 0}|${argSig}`;
+    // Memoize identical (fn, pos, arg-signature) resolutions: an exponential interprocedural fan-out
+    // (f -> g() + g() -> ...) otherwise re-resolves the same call O(2^depth) times. Same key ⟹ same
+    // deterministic result, so this is exact (not lossy) and collapses the fan-out to linear.
+    if (!this._fnRetMemo) this._fnRetMemo = new Map();
+    if (this._fnRetMemo.has(guardKey)) return [...this._fnRetMemo.get(guardKey)];
     if (!this.resolvingFunctionReturns) this.resolvingFunctionReturns = new Set();
     if (this.resolvingFunctionReturns.has(guardKey)) {
         return ["{CALL:recursive}"];
@@ -676,7 +639,7 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
                     }
                 }
                 expanded = expanded.filter(val => val !== "");
-                return expanded.length ? [...new Set(expanded)] : [""];
+                { const _r = expanded.length ? [...new Set(expanded)] : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
             }
         }
     }
@@ -685,28 +648,14 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
     if (fnNode && fnNode.type === "ArrowFunctionExpression" && fnNode.body && fnNode.body.type !== "BlockStatement") {
         returns.push(fnNode.body);
     }
-    const scan = (node) => {
-        if (!node || typeof node !== "object") return;
-        if (node.type === "ReturnStatement") {
-            returns.push(node.argument);
-            return;
-        }
-        if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") return;
-        for (const key in node) {
-            if (key === "parent") continue;
-            const child = node[key];
-            if (Array.isArray(child)) child.forEach(c => scan(c));
-            else scan(child);
-        }
-    };
-    if (!returns.length) scan(fnNode.body || fnNode);
+    if (!returns.length) returns.push(...collectReturns(fnNode.body || fnNode));
 
     let results = [];
     returns.forEach(ret => {
         results = results.concat(this.resolveExpression(ret, fnScope, ret && ret.start ? ret.start : pos, overrides, runtimeEnv));
     });
     results = results.filter(val => val !== "");
-    return results.length ? [...new Set(results)] : [""];
+    { const _r = results.length ? [...new Set(results)] : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
     } finally {
         this.resolvingFunctionReturns.delete(guardKey);
     }
@@ -1133,7 +1082,9 @@ extractFromFunctionBody(body, scope, pos, overrides, runtimeEnv) {
 // limit. Bail gracefully on this subexpression instead of crashing; other sinks still resolve.
 resolveExpression(node, scope, pos, overrides, runtimeEnv) {
     this._resolveDepth = (this._resolveDepth || 0) + 1;
+    this._ops = (this._ops || 0) + 1;
     try {
+        if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; return [""]; }   // global-budget bail -> PARTIAL results
         if (this._resolveDepth > 100) return [""];
         return this._resolveExpressionInner(node, scope, pos, overrides, runtimeEnv);
     } finally {
@@ -1218,7 +1169,7 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             
             // Check if this member expression was assigned a literal value (e.g., l.p = "/client/")
             const name = this.getName(node);
-            if (process.env.DEBUG_VAR) {
+            if (DEBUG_VAR) {
                 const hasMemAssign = this.memberAssignments && this.memberAssignments.has(name);
                 const memAssignSize = this.memberAssignments ? this.memberAssignments.size : 0;
                 console.error(`[RESOLVE] MemberExpr: name=${name}, hasMemAssign=${hasMemAssign}, mapSize=${memAssignSize}`);
