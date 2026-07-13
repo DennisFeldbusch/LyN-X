@@ -1,10 +1,16 @@
 "use strict";
 // Cross-cutting helpers shared by the resolver mixins (resolve.js / runtime.js).
 
-// Global per-file resolver work budget: caps TOTAL resolve operations (via this._ops) so pathological
-// files bail to partial results instead of hanging. Deterministic (op count, not wall-clock, so results
-// are machine-independent). Env-overridable via LYNX_OP_BUDGET; 0 disables.
+// PER-SINK resolver work budget: caps resolve operations (via this._ops) for ONE sink so a deep or
+// combinatorially-explosive sink bails to partial (templated) results instead of hanging — AND, crucially,
+// without starving the other sinks (this._ops is reset per sink in recordResolvedSinkValues). Deterministic
+// (op count, not wall-clock, so results are machine-independent). Env-overridable via LYNX_OP_BUDGET; 0 disables.
 const OP_BUDGET = process.env.LYNX_OP_BUDGET !== undefined ? +process.env.LYNX_OP_BUDGET : 2000000;
+
+// Whole-file ceiling on cumulative resolve operations across ALL sinks (this._totalOps). Backstops the
+// per-sink budget so a file with thousands of expensive sinks can't run unbounded: once crossed, the
+// remaining sinks are skipped (partial file result). Env-overridable via LYNX_TOTAL_BUDGET; 0 disables.
+const TOTAL_BUDGET = process.env.LYNX_TOTAL_BUDGET !== undefined ? +process.env.LYNX_TOTAL_BUDGET : 20000000;
 
 // Collect the argument node of every ReturnStatement in a function body, WITHOUT descending into nested
 // functions (their returns aren't this function's). Pure pre-order AST walk. Callers handle the
@@ -26,4 +32,4 @@ function collectReturns(node) {
     return returns;
 }
 
-module.exports = { OP_BUDGET, collectReturns };
+module.exports = { OP_BUDGET, TOTAL_BUDGET, collectReturns };

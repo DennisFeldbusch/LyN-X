@@ -800,6 +800,12 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
         const arg = node.arguments && node.arguments[0];
         return arg ? this.resolveExpression(arg, scope, pos, overrides, runtimeEnv) : [""];
     }
+    // atob("...") / window.atob(...) — base64-decode concrete args (common skimmer exfil-host hiding that
+    // regex cannot recover: a base64 blob is not a URL literal). Placeholders pass through unchanged.
+    if (calleeName === "atob") {
+        const arg = node.arguments && node.arguments[0];
+        return arg ? this.decodeBase64Values(this.resolveExpression(arg, scope, pos, overrides, runtimeEnv)) : [""];
+    }
     if (node.callee && node.callee.type === "Identifier") {
         const found = this.findLatestDef(scope, node.callee.name, pos);
         if (found && found.def && found.def.node &&
@@ -840,7 +846,18 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
     if (node.callee && node.callee.type === "MemberExpression") {
         const propName = this.getMemberPropertyValue(node.callee, scope, pos, overrides, runtimeEnv);
         const objName = this.getName(node.callee.object);
-        
+
+        // String.fromCharCode(104,116,...) -> the string. Folds char-code obfuscation (invisible to regex).
+        if (propName === "fromCharCode") {
+            const folded = this.foldFromCharCode(node.arguments || [], scope, pos, overrides, runtimeEnv);
+            if (folded) return folded;
+        }
+        // window.atob(...) / self.atob(...) — base64-decode (identifier-form atob handled above).
+        if (propName === "atob") {
+            const arg = node.arguments && node.arguments[0];
+            return arg ? this.decodeBase64Values(this.resolveExpression(arg, scope, pos, overrides, runtimeEnv)) : [""];
+        }
+
         // Try resolving Promise chains (.then, .catch, .finally)
         const promiseChainResult = this.resolvePromiseChain(node, scope, pos, overrides, runtimeEnv);
         if (promiseChainResult && promiseChainResult.length > 0) {
@@ -866,10 +883,31 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
                 return this.buildQueryStrings(params);
             }
         }
-        // String method passthrough: .trim(), .toLowerCase(), .toUpperCase(), .slice(), .substring()
-        const stringPassthrough = /^(trim|trimStart|trimEnd|toLowerCase|toUpperCase|slice|substring|substr|normalize)$/;
-        if (stringPassthrough.test(propName)) {
-            return this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
+        // String transforms: apply the method to CONCRETE receiver values (placeholders pass through
+        // unchanged). Folds case/trim/slice obfuscation; falls back to passthrough if args aren't literal.
+        const stringXform = /^(trim|trimStart|trimEnd|toLowerCase|toUpperCase|slice|substring|substr|normalize)$/;
+        if (stringXform.test(propName)) {
+            const base = this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
+            const a0 = node.arguments && node.arguments[0], a1 = node.arguments && node.arguments[1];
+            const n0 = a0 && a0.type === "Literal" && typeof a0.value === "number" ? a0.value : null;
+            const n1 = a1 && a1.type === "Literal" && typeof a1.value === "number" ? a1.value : null;
+            const needsArg = /^(slice|substring|substr)$/.test(propName);
+            if (needsArg && n0 === null) return base;                 // non-literal index -> can't fold
+            return base.map(v => {
+                if (typeof v !== "string" || v.startsWith("{")) return v;
+                switch (propName) {
+                    case "toLowerCase": return v.toLowerCase();
+                    case "toUpperCase": return v.toUpperCase();
+                    case "trim": return v.trim();
+                    case "trimStart": return v.trimStart();
+                    case "trimEnd": return v.trimEnd();
+                    case "normalize": return v.normalize();
+                    case "slice": return n1 === null ? v.slice(n0) : v.slice(n0, n1);
+                    case "substring": return n1 === null ? v.substring(n0) : v.substring(n0, n1);
+                    case "substr": return n1 === null ? v.substr(n0) : v.substr(n0, n1);
+                    default: return v;
+                }
+            });
         }
         // .replace(pattern, replacement) / .replaceAll(pattern, replacement) with literal args
         if ((propName === "replace" || propName === "replaceAll") && node.arguments && node.arguments.length >= 2) {
@@ -897,10 +935,113 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
             return result;
         }
         if (propName === "join") {
+            const sepArg = node.arguments && node.arguments[0];
+            const sep = sepArg ? this.strLit(sepArg) : ",";        // [].join() defaults to ","
+            const obj = node.callee.object;
+            if (sep !== null) {
+                // ["h","t","t","p"].join("")  — array literal of resolvable elements
+                if (obj.type === "ArrayExpression") {
+                    return this.joinArrayElements(obj.elements, sep, scope, pos, overrides, runtimeEnv);
+                }
+                // parts.join("/") where `parts` is a variable bound to an array literal
+                if (obj.type === "Identifier") {
+                    const found = this.findLatestDef(scope, obj.name, pos);
+                    if (found && found.def && found.def.node && found.def.node.type === "ArrayExpression") {
+                        return this.joinArrayElements(found.def.node.elements, sep, scope, pos, overrides, runtimeEnv);
+                    }
+                }
+                // x.split(A).reverse().join(B) / x.split(A).join(B) — char-array reassembly & reversal
+                const chain = this.splitReverseJoinBase(obj, scope, pos, overrides, runtimeEnv);
+                if (chain) {
+                    const baseVals = this.resolveExpression(chain.base, scope, pos, overrides, runtimeEnv);
+                    return baseVals.map(v => {
+                        if (typeof v !== "string" || v.startsWith("{")) return v;
+                        let parts = v.split(chain.splitSep);
+                        if (chain.reversed) parts = parts.reverse();
+                        return parts.join(sep);
+                    });
+                }
+            }
+            // fallback: prior behavior (elements already concatenated in the object value)
             return this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
         }
     }
     return [`{CALL:${calleeName || "anonymous"}}`];
+}
+,
+
+// --- constant-folding helpers for common obfuscation builtins (operate only on CONCRETE values) ---
+
+// base64-decode each concrete value (atob semantics: binary string); placeholders/{...} pass through.
+decodeBase64Values(vals) {
+    return (vals || []).map(v => {
+        if (typeof v !== "string" || v.startsWith("{")) return v;
+        try { return Buffer.from(v, "base64").toString("latin1"); } catch { return v; }
+    });
+}
+,
+
+// String.fromCharCode(...codes) when every arg resolves to a concrete number; else null (can't fold).
+foldFromCharCode(argNodes, scope, pos, overrides, runtimeEnv) {
+    const codes = [];
+    for (const a of argNodes) {
+        let n = null;
+        if (a.type === "Literal" && typeof a.value === "number") n = a.value;
+        else {
+            const rv = this.resolveExpression(a, scope, pos, overrides, runtimeEnv).find(v => v && !v.startsWith("{"));
+            if (rv != null && /^\d+$/.test(String(rv).trim())) n = parseInt(rv, 10);
+        }
+        if (n == null) return null;
+        codes.push(n);
+    }
+    if (!codes.length) return null;
+    try { return [String.fromCharCode(...codes)]; } catch { return null; }
+}
+,
+
+// The string value of a string-literal node, else null (not a concrete string we can fold with).
+strLit(node) {
+    return node && node.type === "Literal" && typeof node.value === "string" ? node.value : null;
+}
+,
+
+// Join an array literal's elements with sep, resolving each element (bounded cartesian across elements).
+joinArrayElements(elements, sep, scope, pos, overrides, runtimeEnv) {
+    let combos = null;
+    for (const el of elements) {
+        const vals = el ? this.resolveExpression(el, scope, pos, overrides, runtimeEnv) : [""];
+        if (combos === null) { combos = vals.slice(0, this.maxCombos); continue; }
+        const next = [];
+        for (const c of combos) {
+            for (const v of vals) { next.push(c + sep + v); if (next.length >= this.maxCombos) break; }
+            if (next.length >= this.maxCombos) break;
+        }
+        combos = next;
+    }
+    return combos && combos.length ? combos : [""];
+}
+,
+
+// Method name of a `<obj>.<method>(...)` call node, else null (handles computed properties too).
+callMethodName(callNode, scope, pos, overrides, runtimeEnv) {
+    if (!callNode || callNode.type !== "CallExpression" || !callNode.callee || callNode.callee.type !== "MemberExpression") return null;
+    return this.getMemberPropertyValue(callNode.callee, scope, pos, overrides, runtimeEnv);
+}
+,
+
+// Recognize `x.split(SEP)` optionally wrapped in `.reverse()`; returns {base, splitSep, reversed} or null.
+splitReverseJoinBase(obj, scope, pos, overrides, runtimeEnv) {
+    if (!obj || obj.type !== "CallExpression") return null;
+    let reversed = false, inner = obj;
+    if (this.callMethodName(obj, scope, pos, overrides, runtimeEnv) === "reverse" && (!obj.arguments || !obj.arguments.length)) {
+        reversed = true;
+        inner = obj.callee.object;
+    }
+    if (this.callMethodName(inner, scope, pos, overrides, runtimeEnv) !== "split") return null;
+    const sepArg = inner.arguments && inner.arguments[0];
+    const splitSep = this.strLit(sepArg);
+    if (splitSep === null) return null;
+    return { base: inner.callee.object, splitSep, reversed };
 }
 ,
 

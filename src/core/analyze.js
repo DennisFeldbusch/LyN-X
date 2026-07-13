@@ -1,4 +1,4 @@
-const { OP_BUDGET } = require("./shared");
+const { OP_BUDGET, TOTAL_BUDGET } = require("./shared");
 
 module.exports = {
 
@@ -68,11 +68,18 @@ recordResolvedSinkValues(entry, overrides) {
     if (sinkInfo && sinkInfo.isEventHandler) {
         return;
     }
-    
+
+    // Whole-file ceiling reached: stop resolving further sinks (partial file result).
+    if (TOTAL_BUDGET && (this._totalOps || 0) > TOTAL_BUDGET) { this._budgetHit = true; return; }
+    // Per-sink budget: reset the op counter so this sink gets a FULL budget regardless of how much
+    // earlier (possibly deep/explosive) sinks consumed — a shallow sink after a deep one still resolves.
+    this._ops = 0;
+
     const arg = this.getSinkArgumentNode(node, sinkInfo, scope, node.start || 0);
     const pos = node.start || 0;
     const runtimeEnv = this.getRuntimeEnvForNodeChain(node);
     const values = this.resolveExpression(arg, scope, pos, overrides || new Map(), runtimeEnv);
+    this._totalOps = (this._totalOps || 0) + (this._ops || 0);   // accumulate toward the whole-file ceiling
     values.forEach(val => {
         if (!val) return;
         
