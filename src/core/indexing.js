@@ -221,7 +221,8 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
 // _.get(obj,"a.b"), cache.delete(k)) whose first arg isn't a leading-slash path. Regex literals are
 // type "Literal" with a RegExp value (typeof !== "string"), so they're excluded too.
 hasLeadingSlashPathArg(node, idx) {
-    const arg = node.arguments && node.arguments[idx];
+    let arg = node.arguments && node.arguments[idx];
+    if (arg && arg.type === "TaggedTemplateExpression") arg = arg.quasi;   // path`/x/${id}` → the template
     if (!arg) return false;
     if (arg.type === "Literal") return typeof arg.value === "string" && arg.value.startsWith("/");
     if (arg.type === "TemplateLiteral") {
@@ -233,9 +234,76 @@ hasLeadingSlashPathArg(node, idx) {
 }
 ,
 
+// True iff a value node is a CONCRETE path/URL: a string literal or template-literal head that starts with
+// "/" or "http(s)://". Broader than hasLeadingSlashPathArg (which is leading-slash-only) — a request-config
+// `url` may be a full URL. Used to qualify the options-object sink's path property.
+isPathLikeNode(node) {
+    if (!node) return false;
+    if (node.type === "TaggedTemplateExpression") node = node.quasi;      // path`/x/${id}` → the template
+    const ok = (s) => typeof s === "string" && (s.startsWith("/") || /^https?:\/\//i.test(s));
+    if (node.type === "Literal") return ok(node.value);
+    if (node.type === "TemplateLiteral") {
+        const first = node.quasis && node.quasis[0];
+        return first && first.value && ok(first.value.cooked != null ? first.value.cooked : first.value.raw);
+    }
+    return false;
+}
+,
+
+// Options-object HTTP dispatch: a call whose argument is an inline request-config object
+//   fn({ method: "POST", url|path|fullPath|uri|endpoint: "/..." })
+// — the shape used by axios(config)/got and SDK dispatchers (stripe stripeMethod({method,fullPath}),
+// square/sendgrid request({method,path})), where the URL is a PROPERTY, not a positional arg. GATED on a
+// sibling `method` HTTP-verb literal: that excludes SPA router configs ({ path:"/x", component }) which
+// share the path-property shape but never carry a method. Returns the path property's value NODE as
+// sinkInfo.urlNode (getSinkArgumentNode returns urlNode directly, so no positional index is needed).
+restConfigSink(node) {
+    const HTTP = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;
+    const URLPROPS = ["url", "path", "fullPath", "uri", "endpoint"];
+    const keyOf = (p) => (p && p.type === "Property" && !p.computed && p.key)
+        ? (p.key.type === "Identifier" ? p.key.name : (p.key.type === "Literal" ? String(p.key.value) : "")) : "";
+    for (const arg of node.arguments || []) {
+        if (!arg || arg.type !== "ObjectExpression") continue;
+        let methodOk = false, urlNode = null;
+        for (const p of arg.properties) {
+            const k = keyOf(p);
+            if (k === "method" && p.value.type === "Literal" && HTTP.test(String(p.value.value))) methodOk = true;
+            else if (!urlNode && URLPROPS.includes(k) && this.isPathLikeNode(p.value)) urlNode = p.value;
+        }
+        if (methodOk && urlNode) return { name: "rest.config", urlNode };
+    }
+    return null;
+}
+,
+
+// Positional (method, path) dispatch: a call with an ADJACENT (HTTP-verb-literal, path-like) argument
+// pair — request-BUILDER style, e.g. square's builder(cfg, cfg, "POST", "/v2/subscriptions") or
+// stripeMethod("GET", "/v1/x"). This is the general form of the existing xhr.open(method, url) case. The
+// verb literal immediately before a "/path" is a strong, low-FP discriminator (the path alone would be
+// ambiguous; "POST" right before it is not). Returns the path node as sinkInfo.urlNode.
+positionalVerbPathSink(node) {
+    const HTTP = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;
+    const args = node.arguments || [];
+    for (let i = 0; i + 1 < args.length; i++) {
+        const x = args[i];
+        if (x && x.type === "Literal" && typeof x.value === "string" && HTTP.test(x.value) && this.isPathLikeNode(args[i + 1])) {
+            return { name: "rest.method", urlNode: args[i + 1] };
+        }
+    }
+    return null;
+}
+,
+
 isSinkCall(node, scope, pos) {
     if (!node || node.type !== "CallExpression") return null;
     const callee = node.callee;
+    // Callee-agnostic dispatch sinks (fire for axios(config), this.request({...}), stripeMethod(...),
+    // and minified (0,f)(...) builder calls alike). Both are method-verb-gated, so they never shadow a
+    // plain positional string sink (fetch(url), etc.) — those calls carry no HTTP-verb literal.
+    const cfg = this.restConfigSink(node);
+    if (cfg) return cfg;
+    const pvp = this.positionalVerbPathSink(node);
+    if (pvp) return pvp;
 
     const lookupPos = typeof pos === "number" ? pos : (node.start || 0);
 

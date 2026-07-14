@@ -1240,6 +1240,10 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
         case "Literal": return [String(node.value)];
         case "Identifier": return this.resolveIdentifier(node.name, scope, pos, overrides, runtimeEnv);
         case "TemplateLiteral": return this.resolveTemplateLiteral(node, scope, pos, overrides, runtimeEnv);
+        // Tagged template `tag`/x/${y}``: resolve the underlying template (node.quasi), treating the tag as
+        // identity. Path-param encoders (Stainless's `path`/threads/${id}``, etc.) are effectively pass-through
+        // for URL reconstruction — we want the templated path, not the encoded runtime value.
+        case "TaggedTemplateExpression": return this.resolveTemplateLiteral(node.quasi, scope, pos, overrides, runtimeEnv);
         case "BinaryExpression": {
             if (node.operator !== "+") return [""];
             const left = this.resolveExpression(node.left, scope, pos, overrides, runtimeEnv);

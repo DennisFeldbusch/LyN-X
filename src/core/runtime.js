@@ -129,6 +129,7 @@ resolveExpressionRuntime(node, env, pos=0) {
             });
             return parts.reduce((acc, part) => this.cartesianConcat(acc, part), [""]);
         }
+        case "TaggedTemplateExpression": return this.resolveExpressionRuntime(node.quasi, env, pos);   // tag as identity
         case "BinaryExpression": {
             if (node.operator !== "+") return [""];
             const left = this.resolveExpressionRuntime(node.left, env, pos);
