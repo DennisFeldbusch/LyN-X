@@ -215,6 +215,24 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
 }
 ,
 
+// True iff the call's arg #idx is a CONCRETE path starting with "/" — a plain string literal ("/v1/x")
+// or a template literal whose first quasi starts with "/" (`/v1/x/${id}`). This is the qualifier for the
+// REST-dispatch sink: it admits real endpoint paths while excluding non-HTTP verb calls (Map.get(key),
+// _.get(obj,"a.b"), cache.delete(k)) whose first arg isn't a leading-slash path. Regex literals are
+// type "Literal" with a RegExp value (typeof !== "string"), so they're excluded too.
+hasLeadingSlashPathArg(node, idx) {
+    const arg = node.arguments && node.arguments[idx];
+    if (!arg) return false;
+    if (arg.type === "Literal") return typeof arg.value === "string" && arg.value.startsWith("/");
+    if (arg.type === "TemplateLiteral") {
+        const first = arg.quasis && arg.quasis[0];
+        const head = first && first.value && (first.value.cooked != null ? first.value.cooked : first.value.raw);
+        return typeof head === "string" && head.startsWith("/");
+    }
+    return false;
+}
+,
+
 isSinkCall(node, scope, pos) {
     if (!node || node.type !== "CallExpression") return null;
     const callee = node.callee;
@@ -255,9 +273,18 @@ isSinkCall(node, scope, pos) {
     }
 
     if (callee.type === "MemberExpression") {
+        const propName = this.resolveSinkMemberPropName(callee, scope, lookupPos);
+        // REST-client dispatch: <recv>.get|post|put|patch|delete|request("/path"[, ...]). Qualified by a
+        // leading-slash path ARGUMENT, NOT the receiver — so it fires on custom SDK/axios-instance clients
+        // (this.post("/v1/..."), client.get(...), b.uE.get("/api/...")) that aren't in the known-receiver
+        // set (axios/$/http). The slash filter is what keeps non-HTTP verbs out: Map.get(k), _.get(o,"a.b"),
+        // cache.delete(k), emitter.post(msg) — their arg0 doesn't start with "/". Runs BEFORE the this.*
+        // bail below so this.post("/path") is caught. Emits the path (study scores path-template recall).
+        if (/^(get|post|put|patch|delete|request)$/i.test(propName) && this.hasLeadingSlashPathArg(node, 0)) {
+            return { name: `rest.${propName.toLowerCase()}`, urlArgIndex: 0 };
+        }
         if (callee.object && callee.object.type === "ThisExpression") return null;
         const objName = this.getName(callee.object);
-        const propName = this.resolveSinkMemberPropName(callee, scope, lookupPos);
         const memberSink = this.resolveMemberSink(objName, propName, scope, lookupPos);
         if (memberSink) return memberSink;
         // XMLHttpRequest.open(method, url)

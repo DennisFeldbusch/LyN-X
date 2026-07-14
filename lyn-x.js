@@ -50,7 +50,10 @@ Options:
                       NOTHING unless this is set (they still extract <script src> URLs + analyze
                       inline); URL inputs recurse fully by default.
       --no-recurse    Fetch nothing (alias for --recurse 0)
-      --origin URL    Base origin/URL for resolving relative URLs (auto-set from a URL input)
+      --origin URL    Base origin/URL for resolving relative URLs, RFC-style (auto-set from a URL
+                      input); a leading-slash route replaces the base path (use for live-URL checks)
+      --base  URL     Base to CONCATENATE onto root-relative routes, preserving the base's own path
+                      (e.g. .../v1); mirrors SDK baseURL+route. Unlike --origin, keeps the /v1 prefix
       --stack-size N  Re-run with a larger V8 stack (KB) for very deep/large minified JS whose
                       parse recursion overflows. Keep below your OS thread stack ('ulimit -s',
                       default 8192 KB) or Node may segfault; raise 'ulimit -s' to go higher.
@@ -79,6 +82,7 @@ function parseArgs(argv) {
     }
     else if (a === "--no-recurse") o.recurse = 0;
     else if (a === "--origin" || a === "--domain") { const v = argv[i + 1]; if (v && !v.startsWith("--")) { o.origin = v; i++; } }
+    else if (a === "--base") { const v = argv[i + 1]; if (v && !v.startsWith("--")) { o.base = v; i++; } }
     else if (a === "--stack-size") o.stackSize = +argv[++i];
     else if (a === "--no-color") o.color = false;
     else if (a === "--ast") o.ast = true;
@@ -97,6 +101,19 @@ const absolutize = (src, base) => {
   if (src.startsWith("//")) return "https:" + src;
   try { return new URL(src, base || "https://example.invalid").href; } catch { return src; }
 };
+
+// --base: string-CONCATENATE a known base onto root-relative routes, PRESERVING the base's own path
+// (e.g. /v1) — unlike --origin/resolveRel's RFC resolution, where a leading-slash path overrides the base
+// path. This mirrors how API-client SDKs build URLs (baseURL + route), so `.post("/chat/completions")`
+// with --base https://api.openai.com/v1 -> https://api.openai.com/v1/chat/completions. Placeholders
+// ({VAR:}/{CALL:}) ride along untouched since this is a plain string concat.
+function applyBase(url, base) {
+  if (!base || typeof url !== "string" || !url) return url;
+  if (/^https?:\/\//i.test(url)) return url;                    // already absolute
+  if (url.startsWith("//")) return url;                         // protocol-relative (host-relative) → leave
+  if (!url.startsWith("/")) return url;                         // only root-relative routes
+  return base.replace(/\/+$/, "") + url;                        // concat; collapse the slash boundary
+}
 
 // Conservative, placeholder-preserving resolution for EXTRACTED URLs. Resolves root-relative (/…, //…)
 // and path-structured (contains "/") refs against the base; leaves bare tokens ("photo") and
@@ -296,6 +313,10 @@ async function main() {
 
   // Resolve extracted relative URLs against the base (full URL for URL inputs, --origin for local).
   if (baseUrl) rows = dedupeRows(rows.map((r) => ({ ...r, url: resolveRel(r.url, baseUrl) })));
+
+  // --base: string-concat a known base onto root-relative routes (preserves the base path, e.g. /v1).
+  // Separate from --origin so live-URL checks keep RFC resolution while SDK routes get full reconstruction.
+  if (o.base) rows = dedupeRows(rows.map((r) => ({ ...r, url: applyBase(r.url, o.base) })));
 
   if (o.json !== undefined) {   // JSON is the complete export — never filtered
     const outPath = path.resolve(o.json);
