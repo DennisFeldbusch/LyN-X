@@ -471,17 +471,23 @@ handleEventListener(handlerInfo, node, scope, walk, fnScope, position) {
 
 _walkEventHandler(fnNode, scope, walk) {
     if (!fnNode) return;
-    const fnScope = this.createScope(scope);
-    this.fnScopeMap.set(fnNode, fnScope);
-    const params = fnNode.params || [];
-    params.forEach(param => {
-        if (param.type === "Identifier") fnScope.paramNames.add(param.name);
-        if (param.type === "AssignmentPattern" && param.left && param.left.type === "Identifier") {
-            fnScope.paramNames.add(param.left.name);
-        }
-    });
-    const body = fnNode.body && fnNode.body.type === "BlockStatement" ? fnNode.body.body : [fnNode.body];
-    { const b = body.filter(Boolean); for (let i = b.length - 1; i >= 0; i--) walk(b[i], fnScope, fnNode); }
+    // Register the callback's function scope, but do NOT re-walk its body: the main traversal already walks
+    // every function body exactly once (an inline callback is an ordinary CallExpression argument; a named
+    // one is walked at its definition). Re-walking here double-processed the body, and for NESTED event
+    // listeners that doubling compounded to 2^depth — a shared subtree was re-visited tens of thousands of
+    // times, making index() effectively non-terminating on some bundles. `walk` is now unused but kept in
+    // the signature so callers are unchanged.
+    if (!this.fnScopeMap.has(fnNode)) {
+        const fnScope = this.createScope(scope);
+        this.fnScopeMap.set(fnNode, fnScope);
+        const params = fnNode.params || [];
+        params.forEach(param => {
+            if (param.type === "Identifier") fnScope.paramNames.add(param.name);
+            if (param.type === "AssignmentPattern" && param.left && param.left.type === "Identifier") {
+                fnScope.paramNames.add(param.left.name);
+            }
+        });
+    }
 }
 ,
 
@@ -493,6 +499,9 @@ index() {
     };
 
     const stack = [];
+    // Per-property-key Set of literal values already stored under the general ".prop" key, so the dedup
+    // below is O(1) instead of an O(n²) rescan of the whole list (see the push site for why that mattered).
+    const propKeySeen = new Map();
     // Deferred/iterative traversal: `walk` only enqueues; `process` does the per-node work. This
     // replaces native recursion so deeply-nested ASTs (long +/||/method chains in minified bundles)
     // can't overflow the call stack. Children are pushed in reverse so they pop in source order —
@@ -587,9 +596,20 @@ index() {
                 if (!this.memberAssignments.has(propKey)) {
                     this.memberAssignments.set(propKey, []);
                 }
-                // Only add if not already there (prefer explicit var.prop over just .prop)
-                const existing = this.memberAssignments.get(propKey);
-                if (!existing.some(a => a.value === node.right.value)) {
+                // Dedup a repeated literal value under the general ".prop" key. This used to be
+                // `existing.some(a => a.value === node.right.value)` — an O(n²) linear rescan of the whole
+                // list per assignment. Minified bundles assign the same short prop name (`.a`, `.p`, …)
+                // tens of thousands of times, so index() went quadratic and hung — and index() charges no
+                // op-budget, so nothing capped it. A per-key Set makes it O(1). Semantics are unchanged:
+                // string-literal values dedup on first occurrence; non-literal RHS (value === null) never
+                // matched the old scan (null !== node.right.value), so those are always appended.
+                let pushGeneral = true;
+                if (value !== null) {
+                    let seen = propKeySeen.get(propKey);
+                    if (!seen) { seen = new Set(); propKeySeen.set(propKey, seen); }
+                    if (seen.has(value)) pushGeneral = false; else seen.add(value);
+                }
+                if (pushGeneral) {
                     this.memberAssignments.get(propKey).push({ value, node: node.right, pos: node.start || 0, isGeneral: true, ...meta });
                 }
                 
@@ -819,12 +839,18 @@ index() {
             return;
         }
 
+        // Enqueue only real AST children: objects carrying a string `.type` (ESTree nodes), or arrays of
+        // them. This deliberately skips acorn's location bookkeeping (`loc` and its `start`/`end` Position
+        // objects, plus numeric `start`/`end`/`range`). Those aren't AST nodes and hold no sink info — and
+        // in some concatenated bundles acorn SHARES Position objects across many nodes, so the old
+        // "descend into every enumerable key" walk re-traversed that shared metadata combinatorially (a
+        // single Position object was re-visited 25k+ times), making index() effectively non-terminating.
         const kids = [];
         for (const key in node) {
-            if (key === "parent") continue;
+            if (key === "parent" || key === "loc") continue;
             const child = node[key];
-            if (Array.isArray(child)) { for (const c of child) kids.push(c); }
-            else kids.push(child);
+            if (Array.isArray(child)) { for (const c of child) if (c && typeof c.type === "string") kids.push(c); }
+            else if (child && typeof child.type === "string") kids.push(child);
         }
         for (let i = kids.length - 1; i >= 0; i--) walk(kids[i], scope, node);   // reverse -> pop in source order
     };
