@@ -36,7 +36,12 @@ module.exports = {
 
 // Dedupe a value list and cap it at this.maxCombos — the standard terminator for expression fan-out
 // (concatenations/conditionals). Used everywhere a resolver returns a bounded set of candidate strings.
+// Charges the op-budget by INPUT SIZE: building a Set over N strings is O(N) hashing/compares, and that
+// string-dedup is the interproc hot path (a StringEqual-dominated profile). Counting only resolver-call
+// entries undercounted it by orders of magnitude, so one argument resolution could run for ~40s under the
+// per-sink ceiling before bailing. Charging per element makes the budget catch data-volume blowups.
 deduplicateAndCap(values) {
+    this._ops = (this._ops || 0) + (values ? values.length : 0);
     return [...new Set(values)].slice(0, this.maxCombos);
 },
 
@@ -628,15 +633,20 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
             const condInfo = this.extractConditionalMap(fnNode, paramName);
             if (condInfo && (condInfo.map.size > 0 || condInfo.defaultNode)) {
                 let expanded = [];
+                // Cap growth: a conditional map with many keys (or keys resolving to large sets) would grow
+                // `expanded` without bound and re-copy it on every concat (O(n²)); stop once past maxCombos
+                // or the budget is spent, so this can't run away.
                 condInfo.map.forEach((node, key) => {
+                    if (this._budgetHit || expanded.length >= this.maxCombos) return;
                     const localOverrides = new Map(overrides);
                     localOverrides.set(paramName, [String(key)]);
                     expanded = expanded.concat(this.resolveExpression(node, fnScope, pos, localOverrides, runtimeEnv));
                 });
-                if (condInfo.defaultNode) {
+                if (condInfo.defaultNode && !this._budgetHit && expanded.length < this.maxCombos) {
                     const objMapKeys = this.extractObjectMapKeys(condInfo.defaultNode, paramName);
                     if (objMapKeys.length > 0) {
                         objMapKeys.forEach(key => {
+                            if (this._budgetHit || expanded.length >= this.maxCombos) return;
                             const localOverrides = new Map(overrides);
                             localOverrides.set(paramName, [String(key)]);
                             expanded = expanded.concat(this.resolveExpression(condInfo.defaultNode, fnScope, pos, localOverrides, runtimeEnv));
@@ -646,7 +656,7 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
                     }
                 }
                 expanded = expanded.filter(val => val !== "");
-                { const _r = expanded.length ? [...new Set(expanded)] : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
+                { const _r = expanded.length ? this.deduplicateAndCap(expanded) : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
             }
         }
     }
@@ -659,10 +669,11 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
 
     let results = [];
     returns.forEach(ret => {
+        if (this._budgetHit || results.length >= this.maxCombos) return;   // stop accumulating once capped/over budget
         results = results.concat(this.resolveExpression(ret, fnScope, ret && ret.start ? ret.start : pos, overrides, runtimeEnv));
     });
     results = results.filter(val => val !== "");
-    { const _r = results.length ? [...new Set(results)] : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
+    { const _r = results.length ? this.deduplicateAndCap(results) : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
     } finally {
         this.resolvingFunctionReturns.delete(guardKey);
     }

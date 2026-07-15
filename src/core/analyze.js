@@ -1,6 +1,15 @@
 // Resolver budgets are instance props (this.opBudget / this.totalBudget), set from core/shared.js in the
 // LyNX ctor and overridable via the CLI's --op-budget / --total-budget flags.
 
+// Max length of a candidate URL string. Real endpoints are well under this; a longer string is a runaway
+// concatenation (deep +/template chains in obfuscated bundles), not a URL. Dropping over-long combinations
+// bounds cartesianConcat's per-combination cost — the op-budget charges per COMBINATION, not per character,
+// so without this a chain building multi-KB strings did megabytes of string/Set work per charged "op".
+const MAX_VALUE_LEN = 8192;
+// Above this combined length, cartesianConcat adds a length surcharge to the op charge (see add()). Below
+// it (all normal URLs), a combination costs exactly 1 op, so ordinary files are unaffected by the surcharge.
+const LEN_CHARGE_FLOOR = 512;
+
 module.exports = {
 
 /**
@@ -27,8 +36,16 @@ cartesianConcat(left, right) {
         // Charge the work budget PER COMBINATION considered — cartesian growth is the real per-file
         // cost, and the resolvers only check this._ops at their entries (too coarse to catch it here),
         // so counting resolver calls alone let obfuscated bundles run for minutes. Now they bail.
-        this._ops = (this._ops || 0) + 1;
         const combined = String(l || "") + String(r || "");
+        // Charge per combination, PLUS a length surcharge for long strings: a combination's real cost
+        // (build + Set-hash + StringEqual dedup) scales with string length, and interproc's runaway is a
+        // deep concat chain fanning out to hundreds of ~KB strings. A flat "1 per combo" undercounted that
+        // by ~30x, so the budget took 20-40s to trip. The surcharge only kicks in past LEN_CHARGE_FLOOR, so
+        // normal short-URL files (well under it) are charged exactly 1 and keep full results.
+        this._ops = (this._ops || 0) + 1 + (combined.length > LEN_CHARGE_FLOOR ? (combined.length >> 6) : 0);
+        // Drop runaway strings: past MAX_VALUE_LEN it's not a URL, and keeping it makes every downstream
+        // concat/Set-dedup do multi-KB string work per element — the interproc hot path (StringEqual).
+        if (combined.length > MAX_VALUE_LEN) return;
         if (!seen.has(combined)) { seen.add(combined); result.push(combined); }
     };
 
