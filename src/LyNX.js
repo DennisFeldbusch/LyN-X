@@ -6,7 +6,7 @@ const runtime = require("./core/runtime");
 const callgraph = require("./core/callgraph");
 const resolve = require("./core/resolve");
 const analyze = require("./core/analyze");
-const { MAX_COMBOS } = require("./core/shared");
+const { OP_BUDGET, TOTAL_BUDGET, INDEX_BUDGET, MAX_COMBOS } = require("./core/shared");
 
 class LyNX {
     constructor(input) {
@@ -16,6 +16,13 @@ class LyNX {
         this.ast = this.parseCode(this.code);
         this.results = new Set();
         this.maxCombos = MAX_COMBOS;
+        // Per-run work budgets (see core/shared.js). Instance-level so a caller (e.g. the CLI's
+        // --op-budget/--index-budget flags) can raise or disable them per file; default to the shared
+        // env-aware constants. opBudget = per-sink resolver cap; totalBudget = whole-file resolver cap;
+        // indexBudget = AST-node-visit cap for the indexing walk.
+        this.opBudget = OP_BUDGET;
+        this.totalBudget = TOTAL_BUDGET;
+        this.indexBudget = INDEX_BUDGET;
         this.scopeId = 0;
         this.scopeMap = new WeakMap();
         this.fnScopeMap = new WeakMap();

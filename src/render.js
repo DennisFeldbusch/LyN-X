@@ -96,8 +96,8 @@ function renderRaw(rows) {
 // width-adaptive table grouped by originating file: each group's column header (with the file URL as
 // a trailing pseudo-column) sits above a divider, then its rows. LINE/COL/SINK are padded to content
 // globally so columns align across groups.
-function renderTable(rows, { color = true, baseHost = null, columns = process.stdout.columns } = {}) {
-  if (!rows.length) return "No URLs extracted.\n";
+function renderTable(rows, { color = true, baseHost = null, partial = false, columns = process.stdout.columns } = {}) {
+  if (!rows.length) return "No URLs extracted." + (partial ? " (partial)" : "") + "\n";
   const lineW = Math.max(4, ...rows.map((r) => String(r.line).length));
   const colW = Math.max(3, ...rows.map((r) => String(r.col || 0).length));   // COL = char offset of sink in its line
   const sinkW = Math.min(24, Math.max(4, ...rows.map((r) => String(r.sink).length)));
@@ -134,7 +134,9 @@ function renderTable(rows, { color = true, baseHost = null, columns = process.st
   }
   const flag = sensitive ? (color ? sgr(RED, true) : "") + `  (${sensitive} with sensitive sources)` + (color ? RESET : "") : "";
   const scope = order.length > 1 ? ` across ${order.length} files` : "";
-  out += `${head}${rows.length} URL(s)${scope}${rst}${flag}\n`;
+  // "(partial)" when a work budget was hit — the result set is incomplete (some sinks/files unresolved).
+  const partialTag = partial ? "  (partial)" : "";
+  out += `${head}${rows.length} URL(s)${scope}${rst}${flag}${partialTag}\n`;
   return out;
 }
 

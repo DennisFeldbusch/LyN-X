@@ -40,7 +40,7 @@ function printHelp() {
   console.log(`LyN-X v2 — static URL/endpoint extraction from JavaScript
 
 Usage:
-  lynx <file.js | file.html | https://url> [options]
+  lynx <file.js | file.html | https://url> [more files...] [options]
 
 Options:
   -r, --raw           Print only extracted URLs, one per line (no color/table)
@@ -54,6 +54,10 @@ Options:
                       input); a leading-slash route replaces the base path (use for live-URL checks)
       --base  URL     Base to CONCATENATE onto root-relative routes, preserving the base's own path
                       (e.g. .../v1); mirrors SDK baseURL+route. Unlike --origin, keeps the /v1 prefix
+      --op-budget N     Per-sink resolver work cap (ops); raise for deep/complex sinks, 0 disables
+      --index-budget N  Indexing-walk cap (AST-node visits); raise for very large bundles, 0 disables
+      --total-budget N  Whole-file resolver work cap (ops); 0 disables
+                        Hitting any budget yields PARTIAL results (footer shows "(partial)").
       --stack-size N  Re-run with a larger V8 stack (KB) for very deep/large minified JS whose
                       parse recursion overflows. Keep below your OS thread stack ('ulimit -s',
                       default 8192 KB) or Node may segfault; raise 'ulimit -s' to go higher.
@@ -68,8 +72,9 @@ Color: bold = resolved · white = literal · light-blue {var} · dark-blue {call
 }
 
 function parseArgs(argv) {
-  const o = { input: "", raw: false, all: false, recurse: null, origin: null, json: undefined,
+  const o = { inputs: [], raw: false, all: false, recurse: null, origin: null, json: undefined,
     ast: false, astJson: false, color: !!process.stdout.isTTY, timeout: 10000 };
+  const numFlag = (i) => { const v = argv[i + 1]; return (v !== undefined && /^\d+$/.test(v)) ? +v : NaN; };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") o.help = true;
@@ -83,12 +88,17 @@ function parseArgs(argv) {
     else if (a === "--no-recurse") o.recurse = 0;
     else if (a === "--origin" || a === "--domain") { const v = argv[i + 1]; if (v && !v.startsWith("--")) { o.origin = v; i++; } }
     else if (a === "--base") { const v = argv[i + 1]; if (v && !v.startsWith("--")) { o.base = v; i++; } }
+    // Work-budget overrides (0 disables the cap). See core/shared.js: op = per-sink resolver ops,
+    // total = whole-file resolver ops, index = AST-node visits in the indexing walk.
+    else if (a === "--op-budget") { const n = numFlag(i); if (!Number.isNaN(n)) { o.opBudget = n; i++; } }
+    else if (a === "--total-budget") { const n = numFlag(i); if (!Number.isNaN(n)) { o.totalBudget = n; i++; } }
+    else if (a === "--index-budget") { const n = numFlag(i); if (!Number.isNaN(n)) { o.indexBudget = n; i++; } }
     else if (a === "--stack-size") o.stackSize = +argv[++i];
     else if (a === "--no-color") o.color = false;
     else if (a === "--ast") o.ast = true;
     else if (a === "--ast-json") o.astJson = true;
     else if (a === "--json") { const v = argv[i + 1]; if (v && !v.startsWith("--")) { o.json = v; i++; } else o.json = "lynx-results.json"; }
-    else if (!a.startsWith("-") && !o.input) o.input = a;
+    else if (!a.startsWith("-")) o.inputs.push(a);   // positional: one or more file/URL inputs (e.g. lynx *.js)
   }
   return o;
 }
@@ -130,12 +140,24 @@ function resolveRel(url, base) {
   return out.replace(/qphq(\d+)qphq/g, (_, i) => masks[+i] ?? _);
 }
 
+// Per-run analysis state (a CLI invocation is one run): budget overrides from flags, and whether any
+// analyzed unit hit a budget — which flips the "(partial)" footer on. Set once in main().
+const RUN = { budgets: {}, partial: false };
+
 function analyzeSource(code, origin) {
   try {
     const w = new LyNX({ code });
+    if (RUN.budgets.opBudget !== undefined) w.opBudget = RUN.budgets.opBudget;
+    if (RUN.budgets.totalBudget !== undefined) w.totalBudget = RUN.budgets.totalBudget;
+    if (RUN.budgets.indexBudget !== undefined) w.indexBudget = RUN.budgets.indexBudget;
     w.domain = origin || null;   // core does webpack varDomains + root-relative concat when set
     const rows = w.analyze({ printTable: false });
-    if (w._budgetHit) warn("[warn] analysis budget exceeded - partial results (raise LYNX_OP_BUDGET)");
+    if (w._budgetHit) {
+      RUN.partial = true;
+      warn(w._indexBudgetHit
+        ? "[warn] indexing budget exceeded — partial results (raise --index-budget, or 0 to disable)"
+        : "[warn] resolver budget exceeded — partial results (raise --op-budget/--total-budget, or 0 to disable)");
+    }
     return rows;
   } catch (e) {
     warn(`[warn] analysis error, skipping unit: ${(e && e.message) || e}`);
@@ -256,9 +278,54 @@ async function analyzeJs(code, origin, baseUrl, opts, pageLabel) {
   return dedupeRows(out);
 }
 
+// Analyze ONE input (local file or URL): read/fetch, detect HTML vs JS, run the analyzer, and resolve
+// extracted relatives against this input's own base. Rows are tagged with `input` as their file (so the
+// table groups by file). `recurse`'s default is per-input (URL → recurse, local → none), computed here
+// without mutating shared opts, so `lynx page.html local.js` treats each correctly. Returns
+// { rows, baseHost, failed }; `failed` marks a hard read/fetch error (vs. a valid file with no URLs).
+async function analyzeInput(input, o) {
+  const isUrl = /^https?:\/\//i.test(input);
+  const recurse = o.recurse === null ? (isUrl ? Infinity : 0) : o.recurse;
+  const iopts = { ...o, recurse };
+
+  let source, isHtml, baseUrl = null;
+  if (isUrl) {
+    baseUrl = input;                            // full page URL -> resolve every relative against it
+    source = await fetchText(input, iopts);
+    if (source == null) { warn(`Failed to fetch ${input}`); return { rows: [], baseHost: null, failed: true }; }
+    isHtml = isHtmlContent(source);
+  } else {
+    try {
+      source = fs.readFileSync(input, "utf8");
+    } catch (e) {
+      warn(e.code === "ENOENT" ? `file not found: ${input}` : `cannot read ${input}: ${e.message}`);
+      return { rows: [], baseHost: null, failed: true };
+    }
+    // Trust the extension: a .js/.mjs/.json file is JS even if it contains "<script>" strings (social/
+    // analytics bundles do document.write('<script src=...>')) — otherwise looksHtml misfires and we'd
+    // treat it as HTML, extract those tags, and recurse+fetch them over the network. Only sniff when
+    // the extension is not a known code type.
+    isHtml = /\.html?$/i.test(input) || isHtmlContent(source);
+    if (o.origin) baseUrl = /^https?:\/\//i.test(o.origin) ? o.origin : "https://" + o.origin;
+  }
+
+  // parse the base once: `origin` (scheme+host) feeds the core; `baseHost` drives host coloring
+  let origin = null, baseHost = null;
+  if (baseUrl) { try { const u = new URL(baseUrl); origin = u.origin; baseHost = u.hostname; } catch {} }
+
+  let rows = isHtml ? await analyzeHtml(source, origin, baseUrl, iopts, input) : await analyzeJs(source, origin, baseUrl, iopts, input);
+
+  // Resolve extracted relative URLs against the base (full URL for URL inputs, --origin for local).
+  if (baseUrl) rows = dedupeRows(rows.map((r) => ({ ...r, url: resolveRel(r.url, baseUrl) })));
+  // --base: string-concat a known base onto root-relative routes (preserves the base path, e.g. /v1).
+  if (o.base) rows = dedupeRows(rows.map((r) => ({ ...r, url: applyBase(r.url, o.base) })));
+  return { rows, baseHost, failed: false };
+}
+
 async function main() {
   const o = parseArgs(process.argv.slice(2));
-  if (o.help || !o.input) { printHelp(); process.exit(o.help ? 0 : 1); }
+  if (o.help || !o.inputs.length) { printHelp(); process.exit(o.help ? 0 : 1); }
+  RUN.budgets = { opBudget: o.opBudget, totalBudget: o.totalBudget, indexBudget: o.indexBudget };
 
   // V8's stack limit can only be set at process start, so honor --stack-size by re-exec'ing once.
   // Iterative walkers handle deep ASTs during analysis; this covers only acorn's recursive-descent
@@ -275,62 +342,45 @@ async function main() {
     }
   }
 
-  const isUrl = /^https?:\/\//i.test(o.input);
-  if (o.recurse === null) o.recurse = isUrl ? Infinity : 0;   // local = no network; URL = recurse fully
-
-  let source, isHtml, baseUrl = null;
-  if (isUrl) {
-    baseUrl = o.input;                          // full page URL -> resolve every relative against it
-    source = await fetchText(o.input, o);
-    if (source == null) { console.error(`Failed to fetch ${o.input}`); process.exit(1); }
-    isHtml = isHtmlContent(source);
-  } else {
-    try {
-      source = fs.readFileSync(o.input, "utf8");
-    } catch (e) {
-      warn(e.code === "ENOENT" ? `file not found: ${o.input}` : `cannot read ${o.input}: ${e.message}`);
-      process.exit(1);
-    }
-    // Trust the extension: a .js/.mjs/.json file is JS even if it contains "<script>" strings (social/
-    // analytics bundles do document.write('<script src=...>')) — otherwise looksHtml misfires and we'd
-    // treat it as HTML, extract those tags, and recurse+fetch them over the network. Only sniff when
-    // the extension is not a known code type.
-    isHtml = /\.html?$/i.test(o.input) || isHtmlContent(source);
-    if (o.origin) baseUrl = /^https?:\/\//i.test(o.origin) ? o.origin : "https://" + o.origin;
-  }
-
+  // --ast dumps the parsed tree; only meaningful for one source — use the first input.
   if (o.ast || o.astJson) {
-    const w = new LyNX({ code: source });
+    const input = o.inputs[0];
+    let src;
+    if (/^https?:\/\//i.test(input)) src = await fetchText(input, o);
+    else { try { src = fs.readFileSync(input, "utf8"); } catch (e) { warn(`cannot read ${input}: ${e.message}`); src = null; } }
+    if (src == null) process.exit(1);
+    const w = new LyNX({ code: src });
     console.log(o.astJson ? JSON.stringify(w.ast, null, 2) : util.inspect(w.ast, { depth: 8, compact: false, colors: false }));
     return;
   }
 
-  // parse the base once: `origin` (scheme+host) feeds the core; `baseHost` drives host coloring
-  let origin = null, baseHost = null;
-  if (baseUrl) { try { const u = new URL(baseUrl); origin = u.origin; baseHost = u.hostname; } catch {} }
-
-  let rows = isHtml ? await analyzeHtml(source, origin, baseUrl, o, o.input) : await analyzeJs(source, origin, baseUrl, o, o.input);
-
-  // Resolve extracted relative URLs against the base (full URL for URL inputs, --origin for local).
-  if (baseUrl) rows = dedupeRows(rows.map((r) => ({ ...r, url: resolveRel(r.url, baseUrl) })));
-
-  // --base: string-concat a known base onto root-relative routes (preserves the base path, e.g. /v1).
-  // Separate from --origin so live-URL checks keep RFC resolution while SDK routes get full reconstruction.
-  if (o.base) rows = dedupeRows(rows.map((r) => ({ ...r, url: applyBase(r.url, o.base) })));
+  // Analyze every input; rows carry their source file, so they render as per-file groups in one table.
+  let allRows = [];
+  const hosts = new Set();
+  let failed = false;
+  for (const input of o.inputs) {
+    const { rows, baseHost, failed: f } = await analyzeInput(input, o);
+    allRows.push(...rows);
+    if (baseHost) hosts.add(baseHost);
+    if (f) failed = true;
+  }
+  if (o.inputs.length === 1 && failed) process.exit(1);   // preserve single-input hard-error exit code
 
   if (o.json !== undefined) {   // JSON is the complete export — never filtered
     const outPath = path.resolve(o.json);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
-    fs.writeFileSync(outPath, JSON.stringify({ input: o.input, generatedAt: new Date().toISOString(), resultCount: rows.length, results: rows }, null, 2));
+    fs.writeFileSync(outPath, JSON.stringify({ inputs: o.inputs, generatedAt: new Date().toISOString(),
+      partial: RUN.partial, resultCount: allRows.length, results: allRows }, null, 2));
     console.log(`Wrote JSON results to ${outPath}`);
     return;
   }
 
   // Human output shows only real URLs (templated or full) by default; --all keeps non-URL fragments.
-  const shown = o.all ? rows : rows.filter((r) => isUrlLike(r.url));
+  const shown = o.all ? allRows : allRows.filter((r) => isUrlLike(r.url));
+  const baseHost = hosts.size === 1 ? [...hosts][0] : null;   // host coloring is only meaningful with one base
 
   if (o.raw) { process.stdout.write(renderRaw(shown)); return; }   // fast path: no table/color setup
-  process.stdout.write(renderTable(shown, { color: o.color, baseHost }));
+  process.stdout.write(renderTable(shown, { color: o.color, baseHost, partial: RUN.partial }));
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

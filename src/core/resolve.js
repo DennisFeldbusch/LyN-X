@@ -1,8 +1,9 @@
 // Debug flag for tracing variable resolution
 const DEBUG_VAR = process.env.DEBUG_VAR === '1';
 
-// OP_BUDGET (global per-file resolver work cap, via this._ops) + collectReturns are shared with runtime.js.
-const { OP_BUDGET, collectReturns } = require("./shared");
+// The per-sink resolver budget is this.opBudget (set from core/shared.js in the LyNX ctor, CLI-overridable);
+// collectReturns is shared with runtime.js.
+const { collectReturns } = require("./shared");
 
 // Known functions that return URLs or URL-like values
 const URL_RETURNING_FUNCTIONS = {
@@ -305,7 +306,7 @@ _findObjectExprNode(node, scope, pos) {
     this._foenDepth = (this._foenDepth || 0) + 1;
     if (this._foenDepth > 200) { this._foenDepth--; return null; }
     this._ops = (this._ops || 0) + 1;
-    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; this._foenDepth--; return null; }   // global-budget bail
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; this._foenDepth--; return null; }   // per-sink budget bail
     try {
     if (node.type === "ObjectExpression") {
         if (DEBUG_VAR) console.error(`[OBJECT] Direct ObjectExpression found`);
@@ -1240,7 +1241,7 @@ resolveExpression(node, scope, pos, overrides, runtimeEnv) {
     this._resolveDepth = (this._resolveDepth || 0) + 1;
     this._ops = (this._ops || 0) + 1;
     try {
-        if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; return [""]; }   // global-budget bail -> PARTIAL results
+        if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return [""]; }   // per-sink budget bail -> PARTIAL results
         if (this._resolveDepth > 100) return [""];
         return this._resolveExpressionInner(node, scope, pos, overrides, runtimeEnv);
     } finally {

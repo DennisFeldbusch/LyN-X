@@ -1,4 +1,4 @@
-const { OP_BUDGET, collectReturns } = require("./shared");   // shared with resolve.js
+const { collectReturns } = require("./shared");   // the per-sink budget is this.opBudget (shared with resolve.js)
 
 module.exports = {
 
@@ -21,7 +21,7 @@ cloneRuntimeEnv(env) {
     // Over budget: return the env aliased (no copy). Safe because every caller is bailing too —
     // evalStatementRuntime returns [env] immediately once _budgetHit, so no cross-branch mutation happens.
     this._ops = (this._ops || 0) + this.runtimeEnvCost(env);
-    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; return env; }
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return env; }
     const next = this.createRuntimeEnv();
     env.values.forEach((vals, key) => next.values.set(key, new Set(vals)));
     env.arrays.forEach((vals, key) => next.arrays.set(key, vals.map(v => [...v])));
@@ -51,7 +51,7 @@ runtimeEnvCost(env) {
 mergeRuntimeEnvInto(target, source) {
     // Same unbounded-work concern as cloneRuntimeEnv: merging copies the source's value sets/arrays.
     this._ops = (this._ops || 0) + this.runtimeEnvCost(source);
-    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; return; }
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return; }
     source.values.forEach((vals, key) => {
         if (!target.values.has(key)) target.values.set(key, new Set());
         vals.forEach(v => target.values.get(key).add(v));
@@ -111,7 +111,7 @@ resolveExpressionRuntime(node, env, pos=0) {
     this._rtDepth = (this._rtDepth || 0) + 1;
     if (this._rtDepth > 300) { this._rtDepth--; return [""]; }
     this._ops = (this._ops || 0) + 1;
-    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; this._rtDepth--; return [""]; }   // global-budget bail
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; this._rtDepth--; return [""]; }   // global-budget bail
     try {
     switch (node.type) {
         case "Literal": return [String(node.value)];
@@ -537,7 +537,7 @@ evalStatementRuntime(stmt, env) {
     // times without re-entering resolveExpressionRuntime, so its budget check never fires. Charge + bail
     // here too; over budget, degrade to a pass-through env instead of hanging. Mirrors resolveExpressionRuntime.
     this._ops = (this._ops || 0) + 1;
-    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; return [env]; }
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return [env]; }
     const pos = stmt.start || 0;
 
     if (stmt.type === "VariableDeclaration") {

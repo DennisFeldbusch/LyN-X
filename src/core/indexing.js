@@ -857,7 +857,14 @@ index() {
 
     const rootScope = this.createScope(null);
     walk(this.ast, rootScope, null);
-    while (stack.length) { const [n, s, p] = stack.pop(); visit(n, s, p); }
+    // Node-visit budget: if the walk blows past indexBudget, stop on the PARTIALLY-indexed tree. The scopes,
+    // defs, and sinks collected so far stay valid, so analyze() still resolves whatever sinks were reached —
+    // a partial file result instead of a hang. _budgetHit is the shared "results are partial" signal.
+    let visits = 0;
+    while (stack.length) {
+        if (this.indexBudget && ++visits > this.indexBudget) { this._indexBudgetHit = true; this._budgetHit = true; break; }
+        const [n, s, p] = stack.pop(); visit(n, s, p);
+    }
 }
 ,
 

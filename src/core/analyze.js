@@ -1,4 +1,5 @@
-const { OP_BUDGET, TOTAL_BUDGET } = require("./shared");
+// Resolver budgets are instance props (this.opBudget / this.totalBudget), set from core/shared.js in the
+// LyNX ctor and overridable via the CLI's --op-budget / --total-budget flags.
 
 module.exports = {
 
@@ -18,7 +19,7 @@ cartesianConcat(left, right) {
     if (!right || right.length === 0) right = [""];
     // Over budget: skip the product (some resolvers loop cartesianConcat via reduce, with no resolver
     // entry between calls to re-check), returning a truncated LHS so pathological files bail here too.
-    if (OP_BUDGET && this._ops > OP_BUDGET) { this._budgetHit = true; return left.slice(0, max); }
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return left.slice(0, max); }
 
     // Helper to detect placeholder values
     const isPlaceholder = (val) => typeof val === "string" && (val.startsWith("{VAR:") || val.startsWith("{CALL:"));
@@ -70,7 +71,7 @@ recordResolvedSinkValues(entry, overrides) {
     }
 
     // Whole-file ceiling reached: stop resolving further sinks (partial file result).
-    if (TOTAL_BUDGET && (this._totalOps || 0) > TOTAL_BUDGET) { this._budgetHit = true; return; }
+    if (this.totalBudget && (this._totalOps || 0) > this.totalBudget) { this._budgetHit = true; return; }
     // Per-sink budget: reset the op counter so this sink gets a FULL budget regardless of how much
     // earlier (possibly deep/explosive) sinks consumed — a shallow sink after a deep one still resolves.
     this._ops = 0;
