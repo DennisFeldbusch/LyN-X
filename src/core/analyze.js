@@ -119,12 +119,21 @@ isExcludedUrl(url) {
 ,
 
 getSortedResultRows() {
+    const VERB_PREFIX = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(?=\/)/i;   // "GET /repos/…" → strip verb
+    const routeLike = (u) => /^\//.test(u) || /^https?:\/\//i.test(u) || /^\{[A-Z_]+:[^}]*\}\//.test(u);
     const rows = [...this.results]
         .map(entry => {
             const parts = entry.split("|");
             // format: line|col|sink|url  (url may itself contain "|", so rejoin the remainder)
-            return { line: Number(parts[0]), col: Number(parts[1]), sink: parts[2], url: parts.slice(3).join("|") };
+            let sink = parts[2], url = parts.slice(3).join("|");
+            // REST-dispatch sinks may carry a combined "VERB /path" route string (e.g. octokit
+            // request("GET /repos/{owner}/{repo}")) — strip the method so the value is just the path.
+            if (sink.startsWith("rest.")) url = url.replace(VERB_PREFIX, "");
+            return { line: Number(parts[0]), col: Number(parts[1]), sink, url };
         })
+        // The generalized REST sinks fire on loose (verb, <expr>) / (<expr>, verb) shapes where the path is
+        // a variable; keep only genuinely route-shaped results so a non-path arg can't leak (protects precision).
+        .filter(r => !r.sink.startsWith("rest.") || routeLike(r.url))
         .sort((a, b) => a.line - b.line || a.col - b.col || a.sink.localeCompare(b.sink) || a.url.localeCompare(b.url));
     
     // Fallback URL substitution is disabled for now - showing unresolved URLs is more informative

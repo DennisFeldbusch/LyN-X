@@ -12,6 +12,11 @@ const OP_BUDGET = process.env.LYNX_OP_BUDGET !== undefined ? +process.env.LYNX_O
 // remaining sinks are skipped (partial file result). Env-overridable via LYNX_TOTAL_BUDGET; 0 disables.
 const TOTAL_BUDGET = process.env.LYNX_TOTAL_BUDGET !== undefined ? +process.env.LYNX_TOTAL_BUDGET : 20000000;
 
+// Cap on the number of distinct value combinations a single expression may fan out to (this.maxCombos).
+// Bounds the cartesian blow-up of conditionals/concatenations; excess combos are truncated. The one
+// resolver tuning knob that isn't a budget — kept here so all limits live in one place.
+const MAX_COMBOS = 8000;
+
 // Collect the argument node of every ReturnStatement in a function body, WITHOUT descending into nested
 // functions (their returns aren't this function's). Pure pre-order AST walk. Callers handle the
 // arrow-with-expression-body case (() => x) separately, since that has no ReturnStatement.
@@ -32,4 +37,4 @@ function collectReturns(node) {
     return returns;
 }
 
-module.exports = { OP_BUDGET, TOTAL_BUDGET, collectReturns };
+module.exports = { OP_BUDGET, TOTAL_BUDGET, MAX_COMBOS, collectReturns };

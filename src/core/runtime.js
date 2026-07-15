@@ -544,8 +544,7 @@ evalStatementRuntime(stmt, env) {
         stmt.declarations.forEach(decl => {
             // Handle destructuring: const { a, b } = obj
             if (decl.id && decl.id.type === "ObjectPattern" && decl.init) {
-                const initValues = this.resolveExpressionRuntime(decl.init, env, pos);
-                // Try to get object entries from the init node
+                // Get object entries from the init node; individual props are resolved on demand below.
                 const entries = this.resolveObjectEntriesFromRuntime(decl.init, env);
                 (decl.id.properties || []).forEach(prop => {
                     if (!prop || !prop.value || prop.value.type !== "Identifier") return;

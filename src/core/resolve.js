@@ -33,6 +33,12 @@ const EXCLUDED_URL_PATTERNS = [
 
 module.exports = {
 
+// Dedupe a value list and cap it at this.maxCombos — the standard terminator for expression fan-out
+// (concatenations/conditionals). Used everywhere a resolver returns a bounded set of candidate strings.
+deduplicateAndCap(values) {
+    return [...new Set(values)].slice(0, this.maxCombos);
+},
+
 /**
  * Build an enhanced variable chain by tracing assignments
  * e.g., t = r.currentScript -> builds "r.currentScript"
@@ -494,7 +500,7 @@ buildQueryStrings(entries) {
                 next.push(prefix ? `${prefix}&${pair}` : pair);
             });
         });
-        combos = [...new Set(next)].slice(0, this.maxCombos);
+        combos = this.deduplicateAndCap(next);
     });
     return combos.length ? combos : [""];
 }
@@ -909,19 +915,28 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
                 }
             });
         }
-        // .replace(pattern, replacement) / .replaceAll(pattern, replacement) with literal args
+        // .replace(pattern, replacement) / .replaceAll(pattern, replacement). Pattern must be a literal
+        // string (regex/dynamic patterns aren't folded). Replacement may be a literal (concrete fold) OR a
+        // variable/expression — in which case we resolve it and substitute, so a `{token}` path param
+        // (e.g. "/idx/{name}".replace("{name}", id)) becomes a templated `{VAR:id}` segment rather than
+        // being left as literal `{name}` text (which downstream URL resolution would percent-encode).
         if ((propName === "replace" || propName === "replaceAll") && node.arguments && node.arguments.length >= 2) {
             const baseVals = this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
             const patternArg = node.arguments[0];
             const replArg = node.arguments[1];
-            if (patternArg && patternArg.type === "Literal" && typeof patternArg.value === "string" &&
-                replArg && replArg.type === "Literal" && typeof replArg.value === "string") {
-                return baseVals.map(val => {
-                    if (typeof val !== "string" || val.startsWith("{VAR:") || val.startsWith("{CALL:")) return val;
-                    return propName === "replaceAll"
-                        ? val.split(patternArg.value).join(replArg.value)
-                        : val.replace(patternArg.value, replArg.value);
-                });
+            if (patternArg && patternArg.type === "Literal" && typeof patternArg.value === "string") {
+                const replVals = (replArg && replArg.type === "Literal" && typeof replArg.value === "string")
+                    ? [replArg.value]
+                    : this.resolveExpression(replArg, scope, pos, overrides, runtimeEnv);
+                const doRepl = (val, rep) => propName === "replaceAll"
+                    ? val.split(patternArg.value).join(rep)
+                    : val.replace(patternArg.value, rep);
+                const out = [];
+                for (const val of baseVals) {
+                    if (typeof val !== "string") { out.push(val); continue; }
+                    for (const rep of replVals) out.push(typeof rep === "string" ? doRepl(val, rep) : val);
+                }
+                return out.length ? this.deduplicateAndCap(out) : baseVals;
             }
             return baseVals;
         }
@@ -1267,7 +1282,7 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             };
             collectBranches(node.consequent);
             collectBranches(node.alternate);
-            return [...new Set(allBranches.filter(v => v !== ""))].slice(0, this.maxCombos);
+            return this.deduplicateAndCap(allBranches.filter(v => v !== ""));
         }
         case "LogicalExpression": {
             const left = this.resolveExpression(node.left, scope, pos, overrides, runtimeEnv);
@@ -1275,9 +1290,9 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             if (node.operator === "??") {
                 const filtered = left.filter(v => v !== "null" && v !== "undefined" && v !== null && v !== undefined);
                 if (filtered.length === 0) return right;
-                return [...new Set([...filtered, ...right])].slice(0, this.maxCombos);
+                return this.deduplicateAndCap([...filtered, ...right]);
             }
-            return [...new Set([...left, ...right])].slice(0, this.maxCombos);
+            return this.deduplicateAndCap([...left, ...right]);
         }
         case "MemberExpression": {
             const mapResolved = this.resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv);

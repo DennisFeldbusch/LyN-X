@@ -6,6 +6,7 @@ const runtime = require("./core/runtime");
 const callgraph = require("./core/callgraph");
 const resolve = require("./core/resolve");
 const analyze = require("./core/analyze");
+const { MAX_COMBOS } = require("./core/shared");
 
 class LyNX {
     constructor(input) {
@@ -14,7 +15,7 @@ class LyNX {
         this.code = typeof input === "string" ? fs.readFileSync(input, "utf8") : input.code;
         this.ast = this.parseCode(this.code);
         this.results = new Set();
-        this.maxCombos = 8000;
+        this.maxCombos = MAX_COMBOS;
         this.scopeId = 0;
         this.scopeMap = new WeakMap();
         this.fnScopeMap = new WeakMap();
@@ -91,6 +92,25 @@ class LyNX {
     }
 
 }
+
+// The analyzer's methods are composed by mixing five core modules onto the prototype. This is order-
+// sensitive: if two modules export the same method name, the LATER one silently wins (e.g. analyze's
+// cartesianConcat is meant to override any earlier definition). A silent collision is otherwise a
+// debugging trap, so assert that the only overrides are intentional and surface any accidental ones.
+const MIXINS = { indexing, runtime, callgraph, resolve, analyze };
+const INTENTIONAL_OVERRIDES = new Set([]); // add "name" here if a later module is meant to shadow an earlier one
+(function assertNoMixinCollisions() {
+    const owner = new Map();
+    for (const [modName, mod] of Object.entries(MIXINS)) {
+        for (const key of Object.keys(mod)) {
+            if (owner.has(key) && !INTENTIONAL_OVERRIDES.has(key)) {
+                console.warn(`[LyNX] mixin collision: "${key}" defined in both ${owner.get(key)} and ${modName} ` +
+                    `— ${modName} wins. Rename one, or add "${key}" to INTENTIONAL_OVERRIDES.`);
+            }
+            owner.set(key, modName);
+        }
+    }
+})();
 
 Object.assign(
     LyNX.prototype,

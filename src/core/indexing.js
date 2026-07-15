@@ -1,3 +1,14 @@
+"use strict";
+
+// Shared sink-detection vocabularies. Kept as module constants so the same verb/method/global-name lists
+// can't drift between the many predicates that reference them.
+const HTTP_VERB_RE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;           // a bare method token, e.g. "GET"
+const HTTP_VERB_ROUTE_RE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\//i; // combined route, e.g. "GET /repos"
+const FETCH_LIKE_RE = /^(fetch|axios|request|send)$/i;                       // identifier-form request funcs
+const JQUERY_METHOD_RE = /^(get|post|getJSON|getScript|ajax)$/i;             // $.get / $.post / $.ajax / …
+const WINDOW_ALIASES = new Set(["window", "globalThis", "self"]);           // global-this receivers of .fetch/.open
+const GLOBAL_NAMES = new Set(["document", "window", "this", "self", "globalThis"]); // IIFE-aliasable globals
+
 module.exports = {
 
 createScope(parent) {
@@ -143,7 +154,7 @@ resolveUrlProperty(urlValue, prop) {
 ,
 
 resolveIdentifierSink(name, node) {
-    if (/^(fetch|axios|request|send)$/i.test(name)) return { name, urlArgIndex: 0 };
+    if (FETCH_LIKE_RE.test(name)) return { name, urlArgIndex: 0 };
     if (/^importScripts$/i.test(name)) return { name: "importScripts", urlArgIndex: 0 };
     if (/open$/i.test(name)) {
         if (node.arguments && node.arguments[0] && node.arguments[0].type === "Literal" && typeof node.arguments[0].value === "string") {
@@ -190,10 +201,10 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
     if (objName === "axios" && /^(get|post|put|delete|patch|head|request)$/i.test(propName)) {
         return { name: `axios.${propName}`, urlArgIndex: 0 };
     }
-    if ((objName === "window" || objName === "globalThis" || objName === "self") && propName === "fetch") {
+    if (WINDOW_ALIASES.has(objName) && propName === "fetch") {
         return { name: "fetch", urlArgIndex: 0 };
     }
-    if ((objName === "window" || objName === "globalThis" || objName === "self") && propName === "open") {
+    if (WINDOW_ALIASES.has(objName) && propName === "open") {
         return { name: "window.open", urlArgIndex: 0 };
     }
     if (/^(location|window\.location|document\.location)$/.test(objName) && /^(assign|replace)$/.test(propName)) {
@@ -202,7 +213,7 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
     if (objName === "navigator" && propName === "sendBeacon") {
         return { name: "navigator.sendBeacon", urlArgIndex: 0 };
     }
-    if (/^\$|^jQuery$/.test(objName) && /^(get|post|getJSON|getScript|ajax)$/i.test(propName)) {
+    if (/^\$|^jQuery$/.test(objName) && JQUERY_METHOD_RE.test(propName)) {
         return { name: `$.${propName}`, urlArgIndex: 0 };
     }
     if (/^https?$/.test(objName) && /^(request|get)$/.test(propName)) {
@@ -215,38 +226,64 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
 }
 ,
 
-// True iff the call's arg #idx is a CONCRETE path starting with "/" — a plain string literal ("/v1/x")
-// or a template literal whose first quasi starts with "/" (`/v1/x/${id}`). This is the qualifier for the
-// REST-dispatch sink: it admits real endpoint paths while excluding non-HTTP verb calls (Map.get(key),
-// _.get(obj,"a.b"), cache.delete(k)) whose first arg isn't a leading-slash path. Regex literals are
-// type "Literal" with a RegExp value (typeof !== "string"), so they're excluded too.
-hasLeadingSlashPathArg(node, idx) {
-    let arg = node.arguments && node.arguments[idx];
-    if (arg && arg.type === "TaggedTemplateExpression") arg = arg.quasi;   // path`/x/${id}` → the template
-    if (!arg) return false;
-    if (arg.type === "Literal") return typeof arg.value === "string" && arg.value.startsWith("/");
-    if (arg.type === "TemplateLiteral") {
-        const first = arg.quasis && arg.quasis[0];
-        const head = first && first.value && (first.value.cooked != null ? first.value.cooked : first.value.raw);
-        return typeof head === "string" && head.startsWith("/");
-    }
-    return false;
+// True iff a string is ROUTE-SHAPED: starts with "/", "http(s)://", or a combined "VERB /path" prefix
+// (octokit-style request("GET /repos/{owner}/{repo}") — the verb is stripped on emit). Shared qualifier.
+routeHead(s) {
+    return typeof s === "string" &&
+        (s.startsWith("/") || /^https?:\/\//i.test(s) || HTTP_VERB_ROUTE_RE.test(s));
 }
 ,
 
-// True iff a value node is a CONCRETE path/URL: a string literal or template-literal head that starts with
-// "/" or "http(s)://". Broader than hasLeadingSlashPathArg (which is leading-slash-only) — a request-config
-// `url` may be a full URL. Used to qualify the options-object sink's path property.
-isPathLikeNode(node) {
-    if (!node) return false;
+// The concrete string / template-literal head of a node (unwrapping a tagged template), or null.
+pathHeadOf(node) {
+    if (!node) return null;
     if (node.type === "TaggedTemplateExpression") node = node.quasi;      // path`/x/${id}` → the template
-    const ok = (s) => typeof s === "string" && (s.startsWith("/") || /^https?:\/\//i.test(s));
-    if (node.type === "Literal") return ok(node.value);
+    if (node.type === "Literal") return typeof node.value === "string" ? node.value : null;
     if (node.type === "TemplateLiteral") {
         const first = node.quasis && node.quasis[0];
-        return first && first.value && ok(first.value.cooked != null ? first.value.cooked : first.value.raw);
+        const head = first && first.value && (first.value.cooked != null ? first.value.cooked : first.value.raw);
+        return typeof head === "string" ? head : null;
     }
-    return false;
+    return null;
+}
+,
+
+// Qualifier for the verb-METHOD dispatch sink (.get/.post/.request("...")): arg #idx is a concrete route.
+// Admits real endpoints while excluding Map.get(k)/_.get(o,"a.b")/cache.delete(k) (arg isn't route-shaped).
+hasLeadingSlashPathArg(node, idx) {
+    return this.routeHead(this.pathHeadOf(node.arguments && node.arguments[idx]));
+}
+,
+
+// True iff a value node is a concrete route (leading "/", http, or "VERB /path"). Qualifies the
+// options-object sink's path property, and the concrete side of the positional pair.
+isPathLikeNode(node) {
+    return this.routeHead(this.pathHeadOf(node));
+}
+,
+
+// An HTTP verb expressed as a string literal ("GET") OR an enum/const member (HttpMethod.GET, M["GET"]).
+// Returns the uppercased verb, or null. Lets the positional/config sinks match generated SDKs that pass
+// the method as an enum rather than a raw string.
+verbOfNode(node) {
+    if (!node) return null;
+    if (node.type === "Literal" && typeof node.value === "string" && HTTP_VERB_RE.test(node.value)) return node.value.toUpperCase();
+    if (node.type === "MemberExpression" && node.property) {
+        const p = !node.computed && node.property.type === "Identifier" ? node.property.name
+            : (node.property.type === "Literal" ? String(node.property.value) : "");
+        if (HTTP_VERB_RE.test(p)) return p.toUpperCase();
+    }
+    return null;
+}
+,
+
+// A path argument for the positional dispatch sink: a concrete route, OR a plain variable / property
+// reference we resolve backward to the path — e.g. openapi-generator's
+// makeRequestContext(localVarPath, HttpMethod.GET), where `localVarPath = "/api/v1/…"`. A non-path
+// resolved value is dropped downstream by getSortedResultRows' route-shape filter, so this stays precise.
+isPathCandidateNode(node) {
+    if (!node || this.verbOfNode(node)) return false;                    // a verb is the method, not the path
+    return this.isPathLikeNode(node) || node.type === "Identifier" || node.type === "MemberExpression";
 }
 ,
 
@@ -258,7 +295,6 @@ isPathLikeNode(node) {
 // share the path-property shape but never carry a method. Returns the path property's value NODE as
 // sinkInfo.urlNode (getSinkArgumentNode returns urlNode directly, so no positional index is needed).
 restConfigSink(node) {
-    const HTTP = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;
     const URLPROPS = ["url", "path", "fullPath", "uri", "endpoint"];
     const keyOf = (p) => (p && p.type === "Property" && !p.computed && p.key)
         ? (p.key.type === "Identifier" ? p.key.name : (p.key.type === "Literal" ? String(p.key.value) : "")) : "";
@@ -267,7 +303,7 @@ restConfigSink(node) {
         let methodOk = false, urlNode = null;
         for (const p of arg.properties) {
             const k = keyOf(p);
-            if (k === "method" && p.value.type === "Literal" && HTTP.test(String(p.value.value))) methodOk = true;
+            if (k === "method" && this.verbOfNode(p.value)) methodOk = true;   // "GET" literal or HttpMethod.GET enum
             else if (!urlNode && URLPROPS.includes(k) && this.isPathLikeNode(p.value)) urlNode = p.value;
         }
         if (methodOk && urlNode) return { name: "rest.config", urlNode };
@@ -276,21 +312,26 @@ restConfigSink(node) {
 }
 ,
 
-// Positional (method, path) dispatch: a call with an ADJACENT (HTTP-verb-literal, path-like) argument
-// pair — request-BUILDER style, e.g. square's builder(cfg, cfg, "POST", "/v2/subscriptions") or
-// stripeMethod("GET", "/v1/x"). This is the general form of the existing xhr.open(method, url) case. The
-// verb literal immediately before a "/path" is a strong, low-FP discriminator (the path alone would be
-// ambiguous; "POST" right before it is not). Returns the path node as sinkInfo.urlNode.
+// Positional (method, path) dispatch: a call with an ADJACENT verb + path pair, in EITHER order, where the
+// verb is a string literal OR an enum member (HttpMethod.GET) and the path is a concrete route OR a
+// variable. Covers square's builder(cfg,cfg,"POST","/v2/subscriptions"), stripeMethod("GET","/v1/x"), and
+// openapi-generator's makeRequestContext(localVarPath, HttpMethod.GET). The general form of the built-in
+// xhr.open(method, url). The verb is the low-FP discriminator; a non-path resolved value is dropped by
+// getSortedResultRows' route-shape filter, so the loose (verb, <expr>) match stays precise.
 positionalVerbPathSink(node) {
-    const HTTP = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;
     const args = node.arguments || [];
+    let fallback = null;   // a (verb, <variable>) pair — used only if no concrete route pair is found, so a
+                           // config object adjacent to the verb (square: builder(cfg,cfg,"POST","/v2/x"))
+                           // can't win over the real "/v2/x" that follows.
     for (let i = 0; i + 1 < args.length; i++) {
-        const x = args[i];
-        if (x && x.type === "Literal" && typeof x.value === "string" && HTTP.test(x.value) && this.isPathLikeNode(args[i + 1])) {
-            return { name: "rest.method", urlNode: args[i + 1] };
-        }
+        const a = args[i], b = args[i + 1];
+        const path = this.verbOfNode(a) && !this.verbOfNode(b) ? b
+                   : this.verbOfNode(b) && !this.verbOfNode(a) ? a : null;
+        if (!path) continue;
+        if (this.isPathLikeNode(path)) return { name: "rest.method", urlNode: path };   // concrete route wins
+        if (!fallback && this.isPathCandidateNode(path)) fallback = path;                // else remember the variable
     }
-    return null;
+    return fallback ? { name: "rest.method", urlNode: fallback } : null;
 }
 ,
 
@@ -359,7 +400,7 @@ isSinkCall(node, scope, pos) {
         if (propName === "open" && node.arguments && node.arguments.length >= 2) {
             const firstArg = node.arguments[0];
             if (firstArg && firstArg.type === "Literal" && typeof firstArg.value === "string" &&
-                /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$/i.test(firstArg.value)) {
+                HTTP_VERB_RE.test(firstArg.value)) {
                 return { name: "xhr.open", urlArgIndex: 1 };
             }
         }
@@ -736,14 +777,14 @@ index() {
                         // Register as a def (not paramName) so it resolves through the argument
                         this.addDef(fnScope, paramName, argNode, node.start || 0);
                         // Track well-known global aliases for document/window
-                        if (argNode.type === "Identifier" && (argNode.name === "document" || argNode.name === "window" || argNode.name === "this" || argNode.name === "self" || argNode.name === "globalThis")) {
+                        if (argNode.type === "Identifier" && GLOBAL_NAMES.has(argNode.name)) {
                             this.iifeAliases.set(paramName, argNode.name);
                         }
                     } else {
                         // No argument provided — treat as param
                         fnScope.paramNames.add(paramName);
                         if (param.type === "AssignmentPattern" && param.right && param.right.type === "Identifier" &&
-                            (param.right.name === "document" || param.right.name === "window" || param.right.name === "this" || param.right.name === "self" || param.right.name === "globalThis")) {
+                            GLOBAL_NAMES.has(param.right.name)) {
                             this.iifeAliases.set(paramName, param.right.name);
                             this.addDef(fnScope, paramName, param.right, node.start || 0);
                         }
