@@ -25,6 +25,14 @@ const INDEX_BUDGET = process.env.LYNX_INDEX_BUDGET !== undefined ? +process.env.
 // resolver tuning knob that isn't a budget — kept here so all limits live in one place.
 const MAX_COMBOS = 8000;
 
+// Candidate-string length limits, shared by cartesianConcat (analyze.js) and deduplicateAndCap (resolve.js).
+// MAX_VALUE_LEN: past this a string is a runaway concat, not a URL — dropped. LEN_CHARGE_FLOOR: above this,
+// string ops charge the op-budget proportional to length (build + Set-hash + StringEqual scale with length),
+// so long-string fan-out trips the budget promptly; below it every value charges 1, leaving normal
+// short-URL files unaffected.
+const MAX_VALUE_LEN = 8192;
+const LEN_CHARGE_FLOOR = 512;
+
 // Collect the argument node of every ReturnStatement in a function body, WITHOUT descending into nested
 // functions (their returns aren't this function's). Pure pre-order AST walk. Callers handle the
 // arrow-with-expression-body case (() => x) separately, since that has no ReturnStatement.
@@ -54,4 +62,4 @@ function collectReturns(node) {
     return returns;
 }
 
-module.exports = { OP_BUDGET, TOTAL_BUDGET, INDEX_BUDGET, MAX_COMBOS, collectReturns };
+module.exports = { OP_BUDGET, TOTAL_BUDGET, INDEX_BUDGET, MAX_COMBOS, MAX_VALUE_LEN, LEN_CHARGE_FLOOR, collectReturns };

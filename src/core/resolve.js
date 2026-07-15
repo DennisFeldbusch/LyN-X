@@ -2,8 +2,8 @@
 const DEBUG_VAR = process.env.DEBUG_VAR === '1';
 
 // The per-sink resolver budget is this.opBudget (set from core/shared.js in the LyNX ctor, CLI-overridable);
-// collectReturns is shared with runtime.js.
-const { collectReturns } = require("./shared");
+// collectReturns is shared with runtime.js. LEN_CHARGE_FLOOR gates the length surcharge in deduplicateAndCap.
+const { collectReturns, LEN_CHARGE_FLOOR } = require("./shared");
 
 // Known functions that return URLs or URL-like values
 const URL_RETURNING_FUNCTIONS = {
@@ -41,7 +41,16 @@ module.exports = {
 // entries undercounted it by orders of magnitude, so one argument resolution could run for ~40s under the
 // per-sink ceiling before bailing. Charging per element makes the budget catch data-volume blowups.
 deduplicateAndCap(values) {
-    this._ops = (this._ops || 0) + (values ? values.length : 0);
+    if (!values || !values.length) return [];
+    // Charge by data volume: count PLUS a length surcharge for long strings, since building the Set is
+    // O(sum of lengths) of hashing/StringEqual — the 894KB-bundle hot path was thousands of ~KB strings
+    // deduped here, which a flat per-element charge undercounted. Below LEN_CHARGE_FLOOR every value costs
+    // 1 (normal short URLs unaffected). Once the budget is spent, skip the Set entirely and return a plain
+    // truncation — the expensive dedup is exactly what we must not do past budget.
+    let charge = values.length;
+    for (const v of values) if (typeof v === "string" && v.length > LEN_CHARGE_FLOOR) charge += v.length >> 6;
+    this._ops = (this._ops || 0) + charge;
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return values.slice(0, this.maxCombos); }
     return [...new Set(values)].slice(0, this.maxCombos);
 },
 
@@ -492,20 +501,30 @@ getSinkArgumentNode(node, sinkInfo, scope, pos) {
 
 buildQueryStrings(entries) {
     if (!entries || entries.length === 0) return [""];
+    const cap = this.maxCombos || 8000;
     let combos = [""];
     entries.forEach(entry => {
+        if (this._budgetHit) return;
+        // Bound the intermediates: pairs = keyValues × valueValues, and next = combos × pairs. A param
+        // whose key/value resolved to many candidates makes either explode, and the old code built the
+        // FULL product before capping — seconds of wasted string work per sink. Cap both at `cap` (the
+        // result is deduped/capped to maxCombos anyway) so a single call stays O(cap), not O(product).
         const pairs = [];
-        entry.keyValues.forEach(k => {
-            entry.valueValues.forEach(v => {
+        for (const k of entry.keyValues) {
+            if (pairs.length >= cap) break;
+            for (const v of entry.valueValues) {
+                if (pairs.length >= cap) break;
                 pairs.push(`${k}=${v}`);
-            });
-        });
+            }
+        }
         const next = [];
-        combos.forEach(prefix => {
-            pairs.forEach(pair => {
+        for (const prefix of combos) {
+            if (next.length >= cap) break;
+            for (const pair of pairs) {
+                if (next.length >= cap) break;
                 next.push(prefix ? `${prefix}&${pair}` : pair);
-            });
-        });
+            }
+        }
         combos = this.deduplicateAndCap(next);
     });
     return combos.length ? combos : [""];

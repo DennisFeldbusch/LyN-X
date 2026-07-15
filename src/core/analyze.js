@@ -1,14 +1,7 @@
 // Resolver budgets are instance props (this.opBudget / this.totalBudget), set from core/shared.js in the
-// LyNX ctor and overridable via the CLI's --op-budget / --total-budget flags.
-
-// Max length of a candidate URL string. Real endpoints are well under this; a longer string is a runaway
-// concatenation (deep +/template chains in obfuscated bundles), not a URL. Dropping over-long combinations
-// bounds cartesianConcat's per-combination cost — the op-budget charges per COMBINATION, not per character,
-// so without this a chain building multi-KB strings did megabytes of string/Set work per charged "op".
-const MAX_VALUE_LEN = 8192;
-// Above this combined length, cartesianConcat adds a length surcharge to the op charge (see add()). Below
-// it (all normal URLs), a combination costs exactly 1 op, so ordinary files are unaffected by the surcharge.
-const LEN_CHARGE_FLOOR = 512;
+// LyNX ctor and overridable via the CLI's --op-budget / --total-budget flags. String-length limits
+// (MAX_VALUE_LEN / LEN_CHARGE_FLOOR) are shared with resolve.js's deduplicateAndCap.
+const { MAX_VALUE_LEN, LEN_CHARGE_FLOOR } = require("./shared");
 
 module.exports = {
 
