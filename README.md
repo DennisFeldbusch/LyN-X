@@ -1,6 +1,6 @@
 # LyN-X
 <p align="center">
-<img width="229" height="262" alt="image" src="https://github.com/user-attachments/assets/c1c1605a-c216-4577-9846-087f3cfa292e" />
+<img width="411" height="419" alt="image" src="https://github.com/user-attachments/assets/166c3c92-7398-46ba-91e1-ce0ebd1f7f4d" />
 </p>
 
 Fast, purely-static URL/endpoint extraction from JavaScript. Accepts a `.js` file, an HTML file, or
