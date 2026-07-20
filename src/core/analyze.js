@@ -1,54 +1,73 @@
+// Resolver budgets are instance props (this.opBudget / this.totalBudget), set from core/shared.js in the
+// LyNX ctor and overridable via the CLI's --op-budget / --total-budget flags. String-length limits
+// (MAX_VALUE_LEN / LEN_CHARGE_FLOOR) are shared with resolve.js's deduplicateAndCap.
+const { MAX_VALUE_LEN, LEN_CHARGE_FLOOR } = require("./shared");
+
 module.exports = {
 
 /**
  * Create all combinations of concatenating elements from left and right arrays
  * Limits results to maxCombos to avoid explosion
- * 
+ *
  * Enhancement: Prioritize concrete values over placeholders
  * When both left and right have concrete values, those combinations come first.
  */
 cartesianConcat(left, right) {
     const result = [];
+    const seen = new Set();   // O(1) dedup — replaces result.includes() (was O(max^2): THE corpus hot path)
     const max = this.maxCombos || 8000;
-    
+
     if (!left || left.length === 0) left = [""];
     if (!right || right.length === 0) right = [""];
-    
+    // Over budget: skip the product (some resolvers loop cartesianConcat via reduce, with no resolver
+    // entry between calls to re-check), returning a truncated LHS so pathological files bail here too.
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return left.slice(0, max); }
+
     // Helper to detect placeholder values
     const isPlaceholder = (val) => typeof val === "string" && (val.startsWith("{VAR:") || val.startsWith("{CALL:"));
-    
+    const add = (l, r) => {
+        // Charge the work budget PER COMBINATION considered — cartesian growth is the real per-file
+        // cost, and the resolvers only check this._ops at their entries (too coarse to catch it here),
+        // so counting resolver calls alone let obfuscated bundles run for minutes. Now they bail.
+        const combined = String(l || "") + String(r || "");
+        // Charge per combination, PLUS a length surcharge for long strings: a combination's real cost
+        // (build + Set-hash + StringEqual dedup) scales with string length, and interproc's runaway is a
+        // deep concat chain fanning out to hundreds of ~KB strings. A flat "1 per combo" undercounted that
+        // by ~30x, so the budget took 20-40s to trip. The surcharge only kicks in past LEN_CHARGE_FLOOR, so
+        // normal short-URL files (well under it) are charged exactly 1 and keep full results.
+        this._ops = (this._ops || 0) + 1 + (combined.length > LEN_CHARGE_FLOOR ? (combined.length >> 6) : 0);
+        // Drop runaway strings: past MAX_VALUE_LEN it's not a URL, and keeping it makes every downstream
+        // concat/Set-dedup do multi-KB string work per element — the interproc hot path (StringEqual).
+        if (combined.length > MAX_VALUE_LEN) return;
+        if (!seen.has(combined)) { seen.add(combined); result.push(combined); }
+    };
+
     // Categorize values
     const leftConcrete = left.filter(v => !isPlaceholder(v));
     const rightConcrete = right.filter(v => !isPlaceholder(v));
-    
+
     // Priority 1: If both sides have concrete values, combine those first
     if (leftConcrete.length > 0 && rightConcrete.length > 0) {
         for (let l of leftConcrete) {
             if (result.length >= max) break;
             for (let r of rightConcrete) {
                 if (result.length >= max) break;
-                const combined = String(l || "") + String(r || "");
-                if (!result.includes(combined)) {
-                    result.push(combined);
-                }
+                add(l, r);
             }
         }
     }
-    
+
     // Priority 2: Full cartesian product for remaining combinations
     if (result.length < max) {
         for (let l of left) {
             if (result.length >= max) break;
             for (let r of right) {
                 if (result.length >= max) break;
-                const combined = String(l || "") + String(r || "");
-                if (!result.includes(combined)) {
-                    result.push(combined);
-                }
+                add(l, r);
             }
         }
     }
-    
+
     return result.slice(0, max);
 }
 ,
@@ -60,11 +79,18 @@ recordResolvedSinkValues(entry, overrides) {
     if (sinkInfo && sinkInfo.isEventHandler) {
         return;
     }
-    
+
+    // Whole-file ceiling reached: stop resolving further sinks (partial file result).
+    if (this.totalBudget && (this._totalOps || 0) > this.totalBudget) { this._budgetHit = true; return; }
+    // Per-sink budget: reset the op counter so this sink gets a FULL budget regardless of how much
+    // earlier (possibly deep/explosive) sinks consumed — a shallow sink after a deep one still resolves.
+    this._ops = 0;
+
     const arg = this.getSinkArgumentNode(node, sinkInfo, scope, node.start || 0);
     const pos = node.start || 0;
     const runtimeEnv = this.getRuntimeEnvForNodeChain(node);
     const values = this.resolveExpression(arg, scope, pos, overrides || new Map(), runtimeEnv);
+    this._totalOps = (this._totalOps || 0) + (this._ops || 0);   // accumulate toward the whole-file ceiling
     values.forEach(val => {
         if (!val) return;
         
@@ -104,12 +130,21 @@ isExcludedUrl(url) {
 ,
 
 getSortedResultRows() {
+    const VERB_PREFIX = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(?=\/)/i;   // "GET /repos/…" → strip verb
+    const routeLike = (u) => /^\//.test(u) || /^https?:\/\//i.test(u) || /^\{[A-Z_]+:[^}]*\}\//.test(u);
     const rows = [...this.results]
         .map(entry => {
             const parts = entry.split("|");
             // format: line|col|sink|url  (url may itself contain "|", so rejoin the remainder)
-            return { line: Number(parts[0]), col: Number(parts[1]), sink: parts[2], url: parts.slice(3).join("|") };
+            let sink = parts[2], url = parts.slice(3).join("|");
+            // REST-dispatch sinks may carry a combined "VERB /path" route string (e.g. octokit
+            // request("GET /repos/{owner}/{repo}")) — strip the method so the value is just the path.
+            if (sink.startsWith("rest.")) url = url.replace(VERB_PREFIX, "");
+            return { line: Number(parts[0]), col: Number(parts[1]), sink, url };
         })
+        // The generalized REST sinks fire on loose (verb, <expr>) / (<expr>, verb) shapes where the path is
+        // a variable; keep only genuinely route-shaped results so a non-path arg can't leak (protects precision).
+        .filter(r => !r.sink.startsWith("rest.") || routeLike(r.url))
         .sort((a, b) => a.line - b.line || a.col - b.col || a.sink.localeCompare(b.sink) || a.url.localeCompare(b.url));
     
     // Fallback URL substitution is disabled for now - showing unresolved URLs is more informative

@@ -1,3 +1,5 @@
+const { collectReturns } = require("./shared");   // the per-sink budget is this.opBudget (shared with resolve.js)
+
 module.exports = {
 
 createRuntimeEnv() {
@@ -12,6 +14,14 @@ createRuntimeEnv() {
 ,
 
 cloneRuntimeEnv(env) {
+    // Op-budget: deep-copying a large env is a per-file hot path (the profile's cloneRuntimeEnv/
+    // mergeRuntimeEnvInto self-time) and isn't gated by the expression resolver. Charge by the actual
+    // DATA VOLUME copied (sum of contained value counts, not just key counts — a Set/array copy is O(its
+    // size), so counting keys alone lets one clone of a huge env cost billions of copies for ~1 "op").
+    // Over budget: return the env aliased (no copy). Safe because every caller is bailing too —
+    // evalStatementRuntime returns [env] immediately once _budgetHit, so no cross-branch mutation happens.
+    this._ops = (this._ops || 0) + this.runtimeEnvCost(env);
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return env; }
     const next = this.createRuntimeEnv();
     env.values.forEach((vals, key) => next.values.set(key, new Set(vals)));
     env.arrays.forEach((vals, key) => next.arrays.set(key, vals.map(v => [...v])));
@@ -25,7 +35,23 @@ cloneRuntimeEnv(env) {
 }
 ,
 
+runtimeEnvCost(env) {
+    // Data volume of an env: total values across all buckets (+1 so an empty env still costs a tick).
+    // O(#keys), not O(#values) — Set.size / Array.length are O(1) — so cheap to compute before a
+    // clone/merge that IS O(#values).
+    let cost = 1;
+    env.values.forEach(s => { cost += s.size; });
+    env.arrays.forEach(a => { cost += a.length; });
+    env.objects.forEach(o => { cost += o.length; });
+    env.urlParams.forEach(u => { cost += u.length; });
+    return cost;
+}
+,
+
 mergeRuntimeEnvInto(target, source) {
+    // Same unbounded-work concern as cloneRuntimeEnv: merging copies the source's value sets/arrays.
+    this._ops = (this._ops || 0) + this.runtimeEnvCost(source);
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return; }
     source.values.forEach((vals, key) => {
         if (!target.values.has(key)) target.values.set(key, new Set());
         vals.forEach(v => target.values.get(key).add(v));
@@ -80,6 +106,13 @@ mergeAllRuntimeEnvs(envs) {
 
 resolveExpressionRuntime(node, env, pos=0) {
     if (!node) return [""];
+    // Depth guard (mirrors resolveExpression): deep +/||/nested chains in minified bundles would
+    // overflow this mutual recursion. Degrade to "" past the cap instead of crashing the whole file.
+    this._rtDepth = (this._rtDepth || 0) + 1;
+    if (this._rtDepth > 300) { this._rtDepth--; return [""]; }
+    this._ops = (this._ops || 0) + 1;
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; this._rtDepth--; return [""]; }   // global-budget bail
+    try {
     switch (node.type) {
         case "Literal": return [String(node.value)];
         case "Identifier": {
@@ -96,6 +129,7 @@ resolveExpressionRuntime(node, env, pos=0) {
             });
             return parts.reduce((acc, part) => this.cartesianConcat(acc, part), [""]);
         }
+        case "TaggedTemplateExpression": return this.resolveExpressionRuntime(node.quasi, env, pos);   // tag as identity
         case "BinaryExpression": {
             if (node.operator !== "+") return [""];
             const left = this.resolveExpressionRuntime(node.left, env, pos);
@@ -310,6 +344,7 @@ resolveExpressionRuntime(node, env, pos=0) {
         }
         default: return [""];
     }
+    } finally { this._rtDepth--; }
 }
 ,
 
@@ -417,24 +452,10 @@ resolveFunctionReturnRuntime(fnNode, env, argNodes) {
         }
     }
     const returns = [];
-    const scan = (node) => {
-        if (!node || typeof node !== "object") return;
-        if (node.type === "ReturnStatement") {
-            returns.push(node.argument);
-            return;
-        }
-        if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") return;
-        for (const key in node) {
-            if (key === "parent") continue;
-            const child = node[key];
-            if (Array.isArray(child)) child.forEach(c => scan(c));
-            else scan(child);
-        }
-    };
     if (fnNode.type === "ArrowFunctionExpression" && fnNode.body && fnNode.body.type !== "BlockStatement") {
          returns.push(fnNode.body);
     } else {
-         scan(fnNode.body || fnNode);
+         returns.push(...collectReturns(fnNode.body || fnNode));
     }
 
     let results = [];
@@ -511,14 +532,19 @@ handleObjectEntriesForEachRuntime(callExpr, env) {
 
 evalStatementRuntime(stmt, env) {
     if (!stmt) return [env];
+    // Op-budget: statement interpretation (branch fan-out + the env cloning below) is the OTHER unbounded
+    // cost besides expression resolution — a big loop-unroll or many-branch block clones envs thousands of
+    // times without re-entering resolveExpressionRuntime, so its budget check never fires. Charge + bail
+    // here too; over budget, degrade to a pass-through env instead of hanging. Mirrors resolveExpressionRuntime.
+    this._ops = (this._ops || 0) + 1;
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return [env]; }
     const pos = stmt.start || 0;
 
     if (stmt.type === "VariableDeclaration") {
         stmt.declarations.forEach(decl => {
             // Handle destructuring: const { a, b } = obj
             if (decl.id && decl.id.type === "ObjectPattern" && decl.init) {
-                const initValues = this.resolveExpressionRuntime(decl.init, env, pos);
-                // Try to get object entries from the init node
+                // Get object entries from the init node; individual props are resolved on demand below.
                 const entries = this.resolveObjectEntriesFromRuntime(decl.init, env);
                 (decl.id.properties || []).forEach(prop => {
                     if (!prop || !prop.value || prop.value.type !== "Identifier") return;
@@ -701,7 +727,8 @@ evalStatementRuntime(stmt, env) {
         const elements = this.resolveArrayElementsFromRuntime(stmt.right, env);
         if (!elements.length) return [env];
         let envs = [env];
-        elements.forEach(elementValues => {
+        for (const elementValues of elements) {
+            if (this._budgetHit) break;   // op-budget exhausted — stop unrolling
             const next = [];
             envs.forEach(current => {
                 elementValues.forEach(val => {
@@ -712,7 +739,7 @@ evalStatementRuntime(stmt, env) {
                 });
             });
             envs = this.mergeRuntimeEnvs(next);
-        });
+        }
         return envs;
     }
 
@@ -764,6 +791,7 @@ evalStatementRuntime(stmt, env) {
             const bodyStmts = stmt.body.type === "BlockStatement" ? stmt.body.body : [stmt.body];
             let envs = [env];
             for (let idx = elements.length - 1; idx >= 0; idx -= 1) {
+                if (this._budgetHit) break;   // op-budget exhausted — stop unrolling
                 const next = [];
                 envs.forEach(current => {
                     const iterEnv = this.cloneRuntimeEnv(current);
@@ -780,6 +808,7 @@ evalStatementRuntime(stmt, env) {
             const bodyStmts = stmt.body.type === "BlockStatement" ? stmt.body.body : [stmt.body];
             let envs = [env];
             for (let idx = 0; idx < elements.length; idx += 1) {
+                if (this._budgetHit) break;   // op-budget exhausted — stop unrolling
                 const next = [];
                 envs.forEach(current => {
                     const iterEnv = this.cloneRuntimeEnv(current);
@@ -868,13 +897,14 @@ getArrayNameFromLengthMember(node, env) {
 
 evalBlockRuntime(statements, env) {
     let envs = [env];
-    statements.forEach(stmt => {
+    for (const stmt of statements) {
+        if (this._budgetHit) break;   // op-budget exhausted — stop expanding further statements
         const next = [];
         envs.forEach(current => {
             next.push(...this.evalStatementRuntime(stmt, current));
         });
         envs = this.mergeRuntimeEnvs(next);
-    });
+    }
     return envs;
 }
 ,

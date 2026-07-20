@@ -1,6 +1,10 @@
 // Debug flag for tracing variable resolution
 const DEBUG_VAR = process.env.DEBUG_VAR === '1';
 
+// The per-sink resolver budget is this.opBudget (set from core/shared.js in the LyNX ctor, CLI-overridable);
+// collectReturns is shared with runtime.js. LEN_CHARGE_FLOOR gates the length surcharge in deduplicateAndCap.
+const { collectReturns, LEN_CHARGE_FLOOR } = require("./shared");
+
 // Known functions that return URLs or URL-like values
 const URL_RETURNING_FUNCTIONS = {
     'buildUri': true,
@@ -29,6 +33,26 @@ const EXCLUDED_URL_PATTERNS = [
 ];
 
 module.exports = {
+
+// Dedupe a value list and cap it at this.maxCombos — the standard terminator for expression fan-out
+// (concatenations/conditionals). Used everywhere a resolver returns a bounded set of candidate strings.
+// Charges the op-budget by INPUT SIZE: building a Set over N strings is O(N) hashing/compares, and that
+// string-dedup is the interproc hot path (a StringEqual-dominated profile). Counting only resolver-call
+// entries undercounted it by orders of magnitude, so one argument resolution could run for ~40s under the
+// per-sink ceiling before bailing. Charging per element makes the budget catch data-volume blowups.
+deduplicateAndCap(values) {
+    if (!values || !values.length) return [];
+    // Charge by data volume: count PLUS a length surcharge for long strings, since building the Set is
+    // O(sum of lengths) of hashing/StringEqual — the 894KB-bundle hot path was thousands of ~KB strings
+    // deduped here, which a flat per-element charge undercounted. Below LEN_CHARGE_FLOOR every value costs
+    // 1 (normal short URLs unaffected). Once the budget is spent, skip the Set entirely and return a plain
+    // truncation — the expensive dedup is exactly what we must not do past budget.
+    let charge = values.length;
+    for (const v of values) if (typeof v === "string" && v.length > LEN_CHARGE_FLOOR) charge += v.length >> 6;
+    this._ops = (this._ops || 0) + charge;
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return values.slice(0, this.maxCombos); }
+    return [...new Set(values)].slice(0, this.maxCombos);
+},
 
 /**
  * Build an enhanced variable chain by tracing assignments
@@ -191,45 +215,6 @@ bindingScopeId(scope, base, pos) {
 }
 ,
 
-/**
- * Try to extract any concrete value from an identifier's definition,
- * even if not fully resolvable. Used as fallback for better recall.
- */
-extractConcreteValuesFromIdentifier(name, scope, pos, overrides, runtimeEnv) {
-    const found = this.findLatestDef(scope, name, pos);
-    if (!found || !found.def || !found.def.node) return [];
-    const node = found.def.node;
-    
-    // Try direct expression resolution first
-    let results = [];
-    try {
-        const values = this.resolveExpression(node, found.scope, found.def.pos, overrides, runtimeEnv);
-        // Filter out pure placeholders
-        results = values.filter(v => v && typeof v === "string" && v.length > 0 && !v.startsWith("{VAR:"));
-    } catch (e) {
-        // Silently ignore resolution errors
-    }
-    
-    // If resolution resulted in placeholders, try to extract patterns
-    if (results.length === 0 && node.type === "MemberExpression") {
-        // Try to get the full member chain as a string representation
-        const memberChain = this.getName(node);
-        if (memberChain && memberChain.length > 0) {
-            results.push(`{VAR:${memberChain}}`);
-        }
-    }
-    
-    if (results.length === 0 && node.type === "CallExpression") {
-        // For function calls, at least capture the function name
-        const calleeName = this.getName(node.callee);
-        if (calleeName) {
-            results.push(`{CALL:${calleeName}}`);
-        }
-    }
-    
-    return results;
-}
-,
 
 resolveTemplateLiteral(node, scope, pos, overrides, runtimeEnv) {
     const parts = [];
@@ -330,6 +315,13 @@ _findObjectExprNode(node, scope, pos) {
         if (DEBUG_VAR) console.error(`[OBJECT] No node provided`);
         return null;
     }
+    // Depth guard (mirrors resolveExpression): alias/member chains in obfuscated or cyclic code can
+    // drive this self-recursion past the JS stack. Degrade to null (unresolved) past the cap.
+    this._foenDepth = (this._foenDepth || 0) + 1;
+    if (this._foenDepth > 200) { this._foenDepth--; return null; }
+    this._ops = (this._ops || 0) + 1;
+    if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; this._foenDepth--; return null; }   // per-sink budget bail
+    try {
     if (node.type === "ObjectExpression") {
         if (DEBUG_VAR) console.error(`[OBJECT] Direct ObjectExpression found`);
         return { objectNode: node, defScope: scope, defPos: pos };
@@ -413,6 +405,7 @@ _findObjectExprNode(node, scope, pos) {
     }
     if (DEBUG_VAR) console.error(`[OBJECT] Node type not handled: ${node.type}`);
     return null;
+    } finally { this._foenDepth--; }
 }
 ,
 
@@ -508,21 +501,31 @@ getSinkArgumentNode(node, sinkInfo, scope, pos) {
 
 buildQueryStrings(entries) {
     if (!entries || entries.length === 0) return [""];
+    const cap = this.maxCombos || 8000;
     let combos = [""];
     entries.forEach(entry => {
+        if (this._budgetHit) return;
+        // Bound the intermediates: pairs = keyValues × valueValues, and next = combos × pairs. A param
+        // whose key/value resolved to many candidates makes either explode, and the old code built the
+        // FULL product before capping — seconds of wasted string work per sink. Cap both at `cap` (the
+        // result is deduped/capped to maxCombos anyway) so a single call stays O(cap), not O(product).
         const pairs = [];
-        entry.keyValues.forEach(k => {
-            entry.valueValues.forEach(v => {
+        for (const k of entry.keyValues) {
+            if (pairs.length >= cap) break;
+            for (const v of entry.valueValues) {
+                if (pairs.length >= cap) break;
                 pairs.push(`${k}=${v}`);
-            });
-        });
+            }
+        }
         const next = [];
-        combos.forEach(prefix => {
-            pairs.forEach(pair => {
+        for (const prefix of combos) {
+            if (next.length >= cap) break;
+            for (const pair of pairs) {
+                if (next.length >= cap) break;
                 next.push(prefix ? `${prefix}&${pair}` : pair);
-            });
-        });
-        combos = [...new Set(next)].slice(0, this.maxCombos);
+            }
+        }
+        combos = this.deduplicateAndCap(next);
     });
     return combos.length ? combos : [""];
 }
@@ -561,24 +564,10 @@ extractObjectMapKeys(node, paramName) {
 
 extractConditionalMap(node, paramName) {
     const returns = [];
-    const scan = (n) => {
-        if (!n || typeof n !== "object") return;
-        if (n.type === "ReturnStatement") {
-            returns.push(n.argument);
-            return;
-        }
-        if (n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression") return;
-        for (const key in n) {
-            if (key === "parent") continue;
-            const child = n[key];
-            if (Array.isArray(child)) child.forEach(c => scan(c));
-            else scan(child);
-        }
-    };
     if (node && node.type === "ArrowFunctionExpression" && node.body && node.body.type !== "BlockStatement") {
         returns.push(node.body);
     } else {
-        scan(node);
+        returns.push(...collectReturns(node));
     }
     if (returns.length !== 1) return null;
     let current = returns[0];
@@ -619,6 +608,11 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
         .join(",");
     const fnStart = typeof fnNode.start === "number" ? fnNode.start : "na";
     const guardKey = `${fnStart}|${pos || 0}|${argSig}`;
+    // Memoize identical (fn, pos, arg-signature) resolutions: an exponential interprocedural fan-out
+    // (f -> g() + g() -> ...) otherwise re-resolves the same call O(2^depth) times. Same key ⟹ same
+    // deterministic result, so this is exact (not lossy) and collapses the fan-out to linear.
+    if (!this._fnRetMemo) this._fnRetMemo = new Map();
+    if (this._fnRetMemo.has(guardKey)) return [...this._fnRetMemo.get(guardKey)];
     if (!this.resolvingFunctionReturns) this.resolvingFunctionReturns = new Set();
     if (this.resolvingFunctionReturns.has(guardKey)) {
         return ["{CALL:recursive}"];
@@ -658,15 +652,20 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
             const condInfo = this.extractConditionalMap(fnNode, paramName);
             if (condInfo && (condInfo.map.size > 0 || condInfo.defaultNode)) {
                 let expanded = [];
+                // Cap growth: a conditional map with many keys (or keys resolving to large sets) would grow
+                // `expanded` without bound and re-copy it on every concat (O(n²)); stop once past maxCombos
+                // or the budget is spent, so this can't run away.
                 condInfo.map.forEach((node, key) => {
+                    if (this._budgetHit || expanded.length >= this.maxCombos) return;
                     const localOverrides = new Map(overrides);
                     localOverrides.set(paramName, [String(key)]);
                     expanded = expanded.concat(this.resolveExpression(node, fnScope, pos, localOverrides, runtimeEnv));
                 });
-                if (condInfo.defaultNode) {
+                if (condInfo.defaultNode && !this._budgetHit && expanded.length < this.maxCombos) {
                     const objMapKeys = this.extractObjectMapKeys(condInfo.defaultNode, paramName);
                     if (objMapKeys.length > 0) {
                         objMapKeys.forEach(key => {
+                            if (this._budgetHit || expanded.length >= this.maxCombos) return;
                             const localOverrides = new Map(overrides);
                             localOverrides.set(paramName, [String(key)]);
                             expanded = expanded.concat(this.resolveExpression(condInfo.defaultNode, fnScope, pos, localOverrides, runtimeEnv));
@@ -676,7 +675,7 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
                     }
                 }
                 expanded = expanded.filter(val => val !== "");
-                return expanded.length ? [...new Set(expanded)] : [""];
+                { const _r = expanded.length ? this.deduplicateAndCap(expanded) : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
             }
         }
     }
@@ -685,28 +684,15 @@ resolveFunctionReturn(fnNode, scope, pos, argNodes, runtimeEnv) {
     if (fnNode && fnNode.type === "ArrowFunctionExpression" && fnNode.body && fnNode.body.type !== "BlockStatement") {
         returns.push(fnNode.body);
     }
-    const scan = (node) => {
-        if (!node || typeof node !== "object") return;
-        if (node.type === "ReturnStatement") {
-            returns.push(node.argument);
-            return;
-        }
-        if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") return;
-        for (const key in node) {
-            if (key === "parent") continue;
-            const child = node[key];
-            if (Array.isArray(child)) child.forEach(c => scan(c));
-            else scan(child);
-        }
-    };
-    if (!returns.length) scan(fnNode.body || fnNode);
+    if (!returns.length) returns.push(...collectReturns(fnNode.body || fnNode));
 
     let results = [];
     returns.forEach(ret => {
+        if (this._budgetHit || results.length >= this.maxCombos) return;   // stop accumulating once capped/over budget
         results = results.concat(this.resolveExpression(ret, fnScope, ret && ret.start ? ret.start : pos, overrides, runtimeEnv));
     });
     results = results.filter(val => val !== "");
-    return results.length ? [...new Set(results)] : [""];
+    { const _r = results.length ? this.deduplicateAndCap(results) : [""]; this._fnRetMemo.set(guardKey, _r); return _r; }
     } finally {
         this.resolvingFunctionReturns.delete(guardKey);
     }
@@ -728,53 +714,6 @@ getMemberPropertyValue(memberExpr, scope, pos, overrides, runtimeEnv) {
     return memberExpr.computed
         ? this.resolveExpression(memberExpr.property, scope, pos, overrides, runtimeEnv)[0]
         : this.getName(memberExpr.property);
-}
-,
-
-/**
- * Resolve Promise chain methods: .then(callback), .catch(callback), .finally(callback)
- * Extracts and analyzes the callback function to capture what values flow through the promise.
- */
-resolvePromiseChain(node, scope, pos, overrides, runtimeEnv) {
-    if (!node || !node.callee || node.callee.type !== "MemberExpression") return null;
-    const methodName = this.getMemberPropertyValue(node.callee, scope, pos, overrides, runtimeEnv);
-    if (!["then", "catch", "finally"].includes(methodName)) return null;
-    
-    // Get the promise object (the thing being chained)
-    const promiseValues = this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
-    
-    // Get the callback function (first argument for then/catch, any argument for finally)
-    const callbackArg = node.arguments && node.arguments[0];
-    if (!callbackArg) return null;
-    
-    // If callback is a function expression or arrow function, analyze its return
-    if (callbackArg.type === "FunctionExpression" || callbackArg.type === "ArrowFunctionExpression") {
-        const callbackResults = this.resolveFunctionReturn(callbackArg, scope, pos, [], runtimeEnv);
-        if (callbackResults && callbackResults.length > 0) {
-            return callbackResults.filter(v => v !== "");
-        }
-    }
-    
-    // If callback is a reference to a function, resolve that function
-    if (callbackArg.type === "Identifier") {
-        const found = this.findLatestDef(scope, callbackArg.name, pos);
-        if (found && found.def && found.def.node && 
-            (found.def.node.type === "FunctionExpression" || 
-             found.def.node.type === "FunctionDeclaration" || 
-             found.def.node.type === "ArrowFunctionExpression")) {
-            const callbackResults = this.resolveFunctionReturn(found.def.node, scope, pos, [], runtimeEnv);
-            if (callbackResults && callbackResults.length > 0) {
-                return callbackResults.filter(v => v !== "");
-            }
-        }
-    }
-    
-    // For .finally, return the promise values themselves
-    if (methodName === "finally") {
-        return promiseValues;
-    }
-    
-    return null;
 }
 ,
 
@@ -898,6 +837,12 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
         const arg = node.arguments && node.arguments[0];
         return arg ? this.resolveExpression(arg, scope, pos, overrides, runtimeEnv) : [""];
     }
+    // atob("...") / window.atob(...) — base64-decode concrete args (common skimmer exfil-host hiding that
+    // regex cannot recover: a base64 blob is not a URL literal). Placeholders pass through unchanged.
+    if (calleeName === "atob") {
+        const arg = node.arguments && node.arguments[0];
+        return arg ? this.decodeBase64Values(this.resolveExpression(arg, scope, pos, overrides, runtimeEnv)) : [""];
+    }
     if (node.callee && node.callee.type === "Identifier") {
         const found = this.findLatestDef(scope, node.callee.name, pos);
         if (found && found.def && found.def.node &&
@@ -938,7 +883,18 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
     if (node.callee && node.callee.type === "MemberExpression") {
         const propName = this.getMemberPropertyValue(node.callee, scope, pos, overrides, runtimeEnv);
         const objName = this.getName(node.callee.object);
-        
+
+        // String.fromCharCode(104,116,...) -> the string. Folds char-code obfuscation (invisible to regex).
+        if (propName === "fromCharCode") {
+            const folded = this.foldFromCharCode(node.arguments || [], scope, pos, overrides, runtimeEnv);
+            if (folded) return folded;
+        }
+        // window.atob(...) / self.atob(...) — base64-decode (identifier-form atob handled above).
+        if (propName === "atob") {
+            const arg = node.arguments && node.arguments[0];
+            return arg ? this.decodeBase64Values(this.resolveExpression(arg, scope, pos, overrides, runtimeEnv)) : [""];
+        }
+
         // Try resolving Promise chains (.then, .catch, .finally)
         const promiseChainResult = this.resolvePromiseChain(node, scope, pos, overrides, runtimeEnv);
         if (promiseChainResult && promiseChainResult.length > 0) {
@@ -964,24 +920,54 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
                 return this.buildQueryStrings(params);
             }
         }
-        // String method passthrough: .trim(), .toLowerCase(), .toUpperCase(), .slice(), .substring()
-        const stringPassthrough = /^(trim|trimStart|trimEnd|toLowerCase|toUpperCase|slice|substring|substr|normalize)$/;
-        if (stringPassthrough.test(propName)) {
-            return this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
+        // String transforms: apply the method to CONCRETE receiver values (placeholders pass through
+        // unchanged). Folds case/trim/slice obfuscation; falls back to passthrough if args aren't literal.
+        const stringXform = /^(trim|trimStart|trimEnd|toLowerCase|toUpperCase|slice|substring|substr|normalize)$/;
+        if (stringXform.test(propName)) {
+            const base = this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
+            const a0 = node.arguments && node.arguments[0], a1 = node.arguments && node.arguments[1];
+            const n0 = a0 && a0.type === "Literal" && typeof a0.value === "number" ? a0.value : null;
+            const n1 = a1 && a1.type === "Literal" && typeof a1.value === "number" ? a1.value : null;
+            const needsArg = /^(slice|substring|substr)$/.test(propName);
+            if (needsArg && n0 === null) return base;                 // non-literal index -> can't fold
+            return base.map(v => {
+                if (typeof v !== "string" || v.startsWith("{")) return v;
+                switch (propName) {
+                    case "toLowerCase": return v.toLowerCase();
+                    case "toUpperCase": return v.toUpperCase();
+                    case "trim": return v.trim();
+                    case "trimStart": return v.trimStart();
+                    case "trimEnd": return v.trimEnd();
+                    case "normalize": return v.normalize();
+                    case "slice": return n1 === null ? v.slice(n0) : v.slice(n0, n1);
+                    case "substring": return n1 === null ? v.substring(n0) : v.substring(n0, n1);
+                    case "substr": return n1 === null ? v.substr(n0) : v.substr(n0, n1);
+                    default: return v;
+                }
+            });
         }
-        // .replace(pattern, replacement) / .replaceAll(pattern, replacement) with literal args
+        // .replace(pattern, replacement) / .replaceAll(pattern, replacement). Pattern must be a literal
+        // string (regex/dynamic patterns aren't folded). Replacement may be a literal (concrete fold) OR a
+        // variable/expression — in which case we resolve it and substitute, so a `{token}` path param
+        // (e.g. "/idx/{name}".replace("{name}", id)) becomes a templated `{VAR:id}` segment rather than
+        // being left as literal `{name}` text (which downstream URL resolution would percent-encode).
         if ((propName === "replace" || propName === "replaceAll") && node.arguments && node.arguments.length >= 2) {
             const baseVals = this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
             const patternArg = node.arguments[0];
             const replArg = node.arguments[1];
-            if (patternArg && patternArg.type === "Literal" && typeof patternArg.value === "string" &&
-                replArg && replArg.type === "Literal" && typeof replArg.value === "string") {
-                return baseVals.map(val => {
-                    if (typeof val !== "string" || val.startsWith("{VAR:") || val.startsWith("{CALL:")) return val;
-                    return propName === "replaceAll"
-                        ? val.split(patternArg.value).join(replArg.value)
-                        : val.replace(patternArg.value, replArg.value);
-                });
+            if (patternArg && patternArg.type === "Literal" && typeof patternArg.value === "string") {
+                const replVals = (replArg && replArg.type === "Literal" && typeof replArg.value === "string")
+                    ? [replArg.value]
+                    : this.resolveExpression(replArg, scope, pos, overrides, runtimeEnv);
+                const doRepl = (val, rep) => propName === "replaceAll"
+                    ? val.split(patternArg.value).join(rep)
+                    : val.replace(patternArg.value, rep);
+                const out = [];
+                for (const val of baseVals) {
+                    if (typeof val !== "string") { out.push(val); continue; }
+                    for (const rep of replVals) out.push(typeof rep === "string" ? doRepl(val, rep) : val);
+                }
+                return out.length ? this.deduplicateAndCap(out) : baseVals;
             }
             return baseVals;
         }
@@ -995,10 +981,113 @@ resolveCallExpression(node, scope, pos, overrides, runtimeEnv) {
             return result;
         }
         if (propName === "join") {
+            const sepArg = node.arguments && node.arguments[0];
+            const sep = sepArg ? this.strLit(sepArg) : ",";        // [].join() defaults to ","
+            const obj = node.callee.object;
+            if (sep !== null) {
+                // ["h","t","t","p"].join("")  — array literal of resolvable elements
+                if (obj.type === "ArrayExpression") {
+                    return this.joinArrayElements(obj.elements, sep, scope, pos, overrides, runtimeEnv);
+                }
+                // parts.join("/") where `parts` is a variable bound to an array literal
+                if (obj.type === "Identifier") {
+                    const found = this.findLatestDef(scope, obj.name, pos);
+                    if (found && found.def && found.def.node && found.def.node.type === "ArrayExpression") {
+                        return this.joinArrayElements(found.def.node.elements, sep, scope, pos, overrides, runtimeEnv);
+                    }
+                }
+                // x.split(A).reverse().join(B) / x.split(A).join(B) — char-array reassembly & reversal
+                const chain = this.splitReverseJoinBase(obj, scope, pos, overrides, runtimeEnv);
+                if (chain) {
+                    const baseVals = this.resolveExpression(chain.base, scope, pos, overrides, runtimeEnv);
+                    return baseVals.map(v => {
+                        if (typeof v !== "string" || v.startsWith("{")) return v;
+                        let parts = v.split(chain.splitSep);
+                        if (chain.reversed) parts = parts.reverse();
+                        return parts.join(sep);
+                    });
+                }
+            }
+            // fallback: prior behavior (elements already concatenated in the object value)
             return this.resolveExpression(node.callee.object, scope, pos, overrides, runtimeEnv);
         }
     }
     return [`{CALL:${calleeName || "anonymous"}}`];
+}
+,
+
+// --- constant-folding helpers for common obfuscation builtins (operate only on CONCRETE values) ---
+
+// base64-decode each concrete value (atob semantics: binary string); placeholders/{...} pass through.
+decodeBase64Values(vals) {
+    return (vals || []).map(v => {
+        if (typeof v !== "string" || v.startsWith("{")) return v;
+        try { return Buffer.from(v, "base64").toString("latin1"); } catch { return v; }
+    });
+}
+,
+
+// String.fromCharCode(...codes) when every arg resolves to a concrete number; else null (can't fold).
+foldFromCharCode(argNodes, scope, pos, overrides, runtimeEnv) {
+    const codes = [];
+    for (const a of argNodes) {
+        let n = null;
+        if (a.type === "Literal" && typeof a.value === "number") n = a.value;
+        else {
+            const rv = this.resolveExpression(a, scope, pos, overrides, runtimeEnv).find(v => v && !v.startsWith("{"));
+            if (rv != null && /^\d+$/.test(String(rv).trim())) n = parseInt(rv, 10);
+        }
+        if (n == null) return null;
+        codes.push(n);
+    }
+    if (!codes.length) return null;
+    try { return [String.fromCharCode(...codes)]; } catch { return null; }
+}
+,
+
+// The string value of a string-literal node, else null (not a concrete string we can fold with).
+strLit(node) {
+    return node && node.type === "Literal" && typeof node.value === "string" ? node.value : null;
+}
+,
+
+// Join an array literal's elements with sep, resolving each element (bounded cartesian across elements).
+joinArrayElements(elements, sep, scope, pos, overrides, runtimeEnv) {
+    let combos = null;
+    for (const el of elements) {
+        const vals = el ? this.resolveExpression(el, scope, pos, overrides, runtimeEnv) : [""];
+        if (combos === null) { combos = vals.slice(0, this.maxCombos); continue; }
+        const next = [];
+        for (const c of combos) {
+            for (const v of vals) { next.push(c + sep + v); if (next.length >= this.maxCombos) break; }
+            if (next.length >= this.maxCombos) break;
+        }
+        combos = next;
+    }
+    return combos && combos.length ? combos : [""];
+}
+,
+
+// Method name of a `<obj>.<method>(...)` call node, else null (handles computed properties too).
+callMethodName(callNode, scope, pos, overrides, runtimeEnv) {
+    if (!callNode || callNode.type !== "CallExpression" || !callNode.callee || callNode.callee.type !== "MemberExpression") return null;
+    return this.getMemberPropertyValue(callNode.callee, scope, pos, overrides, runtimeEnv);
+}
+,
+
+// Recognize `x.split(SEP)` optionally wrapped in `.reverse()`; returns {base, splitSep, reversed} or null.
+splitReverseJoinBase(obj, scope, pos, overrides, runtimeEnv) {
+    if (!obj || obj.type !== "CallExpression") return null;
+    let reversed = false, inner = obj;
+    if (this.callMethodName(obj, scope, pos, overrides, runtimeEnv) === "reverse" && (!obj.arguments || !obj.arguments.length)) {
+        reversed = true;
+        inner = obj.callee.object;
+    }
+    if (this.callMethodName(inner, scope, pos, overrides, runtimeEnv) !== "split") return null;
+    const sepArg = inner.arguments && inner.arguments[0];
+    const splitSep = this.strLit(sepArg);
+    if (splitSep === null) return null;
+    return { base: inner.callee.object, splitSep, reversed };
 }
 ,
 
@@ -1175,55 +1264,14 @@ extractFromFunctionBody(body, scope, pos, overrides, runtimeEnv) {
 }
 ,
 
-/**
- * Handle async generator functions and generator expressions
- * These wrap URLs in Promise chains with yield operators
- */
-resolveAsyncGenerator(node, scope, pos, overrides, runtimeEnv) {
-    if (!node || (node.async !== true && node.generator !== true)) return [];
-    const values = [];
-    
-    // Extract from generator body
-    if (node.body && node.body.type === "BlockStatement") {
-        for (const statement of node.body.body) {
-            if (!statement) continue;
-            
-            // yield expressions: yield x.url;
-            if (statement.type === "ExpressionStatement" && statement.expression && statement.expression.type === "YieldExpression") {
-                const resolved = this.resolveExpression(
-                    statement.expression.argument,
-                    scope,
-                    pos,
-                    overrides,
-                    runtimeEnv
-                );
-                values.push(...resolved);
-            }
-            
-            // return statements: return x.url;
-            if (statement.type === "ReturnStatement" && statement.argument) {
-                const resolved = this.resolveExpression(
-                    statement.argument,
-                    scope,
-                    pos,
-                    overrides,
-                    runtimeEnv
-                );
-                values.push(...resolved);
-            }
-        }
-    }
-    
-    return values;
-}
-,
-
 // Depth-guarded entry: pathological/obfuscated code can drive the mutual recursion
 // (resolveExpression <-> resolveCallExpression / resolveDeepObjectProperty) past the JS stack
 // limit. Bail gracefully on this subexpression instead of crashing; other sinks still resolve.
 resolveExpression(node, scope, pos, overrides, runtimeEnv) {
     this._resolveDepth = (this._resolveDepth || 0) + 1;
+    this._ops = (this._ops || 0) + 1;
     try {
+        if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; return [""]; }   // per-sink budget bail -> PARTIAL results
         if (this._resolveDepth > 100) return [""];
         return this._resolveExpressionInner(node, scope, pos, overrides, runtimeEnv);
     } finally {
@@ -1238,6 +1286,10 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
         case "Literal": return [String(node.value)];
         case "Identifier": return this.resolveIdentifier(node.name, scope, pos, overrides, runtimeEnv);
         case "TemplateLiteral": return this.resolveTemplateLiteral(node, scope, pos, overrides, runtimeEnv);
+        // Tagged template `tag`/x/${y}``: resolve the underlying template (node.quasi), treating the tag as
+        // identity. Path-param encoders (Stainless's `path`/threads/${id}``, etc.) are effectively pass-through
+        // for URL reconstruction — we want the templated path, not the encoded runtime value.
+        case "TaggedTemplateExpression": return this.resolveTemplateLiteral(node.quasi, scope, pos, overrides, runtimeEnv);
         case "BinaryExpression": {
             if (node.operator !== "+") return [""];
             const left = this.resolveExpression(node.left, scope, pos, overrides, runtimeEnv);
@@ -1261,7 +1313,7 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             };
             collectBranches(node.consequent);
             collectBranches(node.alternate);
-            return [...new Set(allBranches.filter(v => v !== ""))].slice(0, this.maxCombos);
+            return this.deduplicateAndCap(allBranches.filter(v => v !== ""));
         }
         case "LogicalExpression": {
             const left = this.resolveExpression(node.left, scope, pos, overrides, runtimeEnv);
@@ -1269,9 +1321,9 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             if (node.operator === "??") {
                 const filtered = left.filter(v => v !== "null" && v !== "undefined" && v !== null && v !== undefined);
                 if (filtered.length === 0) return right;
-                return [...new Set([...filtered, ...right])].slice(0, this.maxCombos);
+                return this.deduplicateAndCap([...filtered, ...right]);
             }
-            return [...new Set([...left, ...right])].slice(0, this.maxCombos);
+            return this.deduplicateAndCap([...left, ...right]);
         }
         case "MemberExpression": {
             const mapResolved = this.resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv);
@@ -1308,7 +1360,7 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             
             // Check if this member expression was assigned a literal value (e.g., l.p = "/client/")
             const name = this.getName(node);
-            if (process.env.DEBUG_VAR) {
+            if (DEBUG_VAR) {
                 const hasMemAssign = this.memberAssignments && this.memberAssignments.has(name);
                 const memAssignSize = this.memberAssignments ? this.memberAssignments.size : 0;
                 console.error(`[RESOLVE] MemberExpr: name=${name}, hasMemAssign=${hasMemAssign}, mapSize=${memAssignSize}`);

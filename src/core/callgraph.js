@@ -109,7 +109,10 @@ serializeOverrides(overrides) {
 resolveFunctionCallsInterprocedurally(entryCalls, sinksByFunction, callsByFunction) {
     const maxDepth = 12;
     const visit = (fnNode, overrides, depth, seen) => {
-        if (!fnNode || depth > maxDepth) return;
+        // Once the resolver budget is spent, stop the WHOLE interproc traversal. Individual
+        // resolveExpression calls already bail cheaply past budget, but on huge call graphs even the
+        // cheap-bail traversal (millions of no-op recursions) costs real wall-clock — so cut it off here.
+        if (!fnNode || depth > maxDepth || this._budgetHit) return;
         const signature = `${fnNode.start || 0}:${this.serializeOverrides(overrides)}`;
         if (seen.has(signature)) return;
         seen.add(signature);
@@ -122,6 +125,7 @@ resolveFunctionCallsInterprocedurally(entryCalls, sinksByFunction, callsByFuncti
 
         const nestedCalls = callsByFunction.get(fnNode) || [];
         nestedCalls.forEach(callEntry => {
+            if (this._budgetHit) return;
             const childFnNode = this.resolveCalledFunctionNode(callEntry);
             if (!childFnNode) return;
             const childOverrides = this.buildCallOverrides(childFnNode, callEntry, overrides || new Map());
@@ -130,6 +134,7 @@ resolveFunctionCallsInterprocedurally(entryCalls, sinksByFunction, callsByFuncti
     };
 
     entryCalls.forEach(callEntry => {
+        if (this._budgetHit) return;   // budget spent -> stop launching new entry-call traversals
         const fnNode = this.resolveCalledFunctionNode(callEntry);
         if (!fnNode) return;
         const overrides = this.buildCallOverrides(fnNode, callEntry, new Map());

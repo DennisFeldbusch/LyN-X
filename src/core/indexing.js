@@ -1,3 +1,14 @@
+"use strict";
+
+// Shared sink-detection vocabularies. Kept as module constants so the same verb/method/global-name lists
+// can't drift between the many predicates that reference them.
+const HTTP_VERB_RE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;           // a bare method token, e.g. "GET"
+const HTTP_VERB_ROUTE_RE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\//i; // combined route, e.g. "GET /repos"
+const FETCH_LIKE_RE = /^(fetch|axios|request|send)$/i;                       // identifier-form request funcs
+const JQUERY_METHOD_RE = /^(get|post|getJSON|getScript|ajax)$/i;             // $.get / $.post / $.ajax / …
+const WINDOW_ALIASES = new Set(["window", "globalThis", "self"]);           // global-this receivers of .fetch/.open
+const GLOBAL_NAMES = new Set(["document", "window", "this", "self", "globalThis"]); // IIFE-aliasable globals
+
 module.exports = {
 
 createScope(parent) {
@@ -143,7 +154,7 @@ resolveUrlProperty(urlValue, prop) {
 ,
 
 resolveIdentifierSink(name, node) {
-    if (/^(fetch|axios|request|send)$/i.test(name)) return { name, urlArgIndex: 0 };
+    if (FETCH_LIKE_RE.test(name)) return { name, urlArgIndex: 0 };
     if (/^importScripts$/i.test(name)) return { name: "importScripts", urlArgIndex: 0 };
     if (/open$/i.test(name)) {
         if (node.arguments && node.arguments[0] && node.arguments[0].type === "Literal" && typeof node.arguments[0].value === "string") {
@@ -190,10 +201,10 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
     if (objName === "axios" && /^(get|post|put|delete|patch|head|request)$/i.test(propName)) {
         return { name: `axios.${propName}`, urlArgIndex: 0 };
     }
-    if ((objName === "window" || objName === "globalThis" || objName === "self") && propName === "fetch") {
+    if (WINDOW_ALIASES.has(objName) && propName === "fetch") {
         return { name: "fetch", urlArgIndex: 0 };
     }
-    if ((objName === "window" || objName === "globalThis" || objName === "self") && propName === "open") {
+    if (WINDOW_ALIASES.has(objName) && propName === "open") {
         return { name: "window.open", urlArgIndex: 0 };
     }
     if (/^(location|window\.location|document\.location)$/.test(objName) && /^(assign|replace)$/.test(propName)) {
@@ -202,7 +213,7 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
     if (objName === "navigator" && propName === "sendBeacon") {
         return { name: "navigator.sendBeacon", urlArgIndex: 0 };
     }
-    if (/^\$|^jQuery$/.test(objName) && /^(get|post|getJSON|getScript|ajax)$/i.test(propName)) {
+    if (/^\$|^jQuery$/.test(objName) && JQUERY_METHOD_RE.test(propName)) {
         return { name: `$.${propName}`, urlArgIndex: 0 };
     }
     if (/^https?$/.test(objName) && /^(request|get)$/.test(propName)) {
@@ -215,9 +226,125 @@ resolveMemberSink(objNameRaw, propName, scope, lookupPos) {
 }
 ,
 
+// True iff a string is ROUTE-SHAPED: starts with "/", "http(s)://", or a combined "VERB /path" prefix
+// (octokit-style request("GET /repos/{owner}/{repo}") — the verb is stripped on emit). Shared qualifier.
+routeHead(s) {
+    return typeof s === "string" &&
+        (s.startsWith("/") || /^https?:\/\//i.test(s) || HTTP_VERB_ROUTE_RE.test(s));
+}
+,
+
+// The concrete string / template-literal head of a node (unwrapping a tagged template), or null.
+pathHeadOf(node) {
+    if (!node) return null;
+    if (node.type === "TaggedTemplateExpression") node = node.quasi;      // path`/x/${id}` → the template
+    if (node.type === "Literal") return typeof node.value === "string" ? node.value : null;
+    if (node.type === "TemplateLiteral") {
+        const first = node.quasis && node.quasis[0];
+        const head = first && first.value && (first.value.cooked != null ? first.value.cooked : first.value.raw);
+        return typeof head === "string" ? head : null;
+    }
+    return null;
+}
+,
+
+// Qualifier for the verb-METHOD dispatch sink (.get/.post/.request("...")): arg #idx is a concrete route.
+// Admits real endpoints while excluding Map.get(k)/_.get(o,"a.b")/cache.delete(k) (arg isn't route-shaped).
+hasLeadingSlashPathArg(node, idx) {
+    return this.routeHead(this.pathHeadOf(node.arguments && node.arguments[idx]));
+}
+,
+
+// True iff a value node is a concrete route (leading "/", http, or "VERB /path"). Qualifies the
+// options-object sink's path property, and the concrete side of the positional pair.
+isPathLikeNode(node) {
+    return this.routeHead(this.pathHeadOf(node));
+}
+,
+
+// An HTTP verb expressed as a string literal ("GET") OR an enum/const member (HttpMethod.GET, M["GET"]).
+// Returns the uppercased verb, or null. Lets the positional/config sinks match generated SDKs that pass
+// the method as an enum rather than a raw string.
+verbOfNode(node) {
+    if (!node) return null;
+    if (node.type === "Literal" && typeof node.value === "string" && HTTP_VERB_RE.test(node.value)) return node.value.toUpperCase();
+    if (node.type === "MemberExpression" && node.property) {
+        const p = !node.computed && node.property.type === "Identifier" ? node.property.name
+            : (node.property.type === "Literal" ? String(node.property.value) : "");
+        if (HTTP_VERB_RE.test(p)) return p.toUpperCase();
+    }
+    return null;
+}
+,
+
+// A path argument for the positional dispatch sink: a concrete route, OR a plain variable / property
+// reference we resolve backward to the path — e.g. openapi-generator's
+// makeRequestContext(localVarPath, HttpMethod.GET), where `localVarPath = "/api/v1/…"`. A non-path
+// resolved value is dropped downstream by getSortedResultRows' route-shape filter, so this stays precise.
+isPathCandidateNode(node) {
+    if (!node || this.verbOfNode(node)) return false;                    // a verb is the method, not the path
+    return this.isPathLikeNode(node) || node.type === "Identifier" || node.type === "MemberExpression";
+}
+,
+
+// Options-object HTTP dispatch: a call whose argument is an inline request-config object
+//   fn({ method: "POST", url|path|fullPath|uri|endpoint: "/..." })
+// — the shape used by axios(config)/got and SDK dispatchers (stripe stripeMethod({method,fullPath}),
+// square/sendgrid request({method,path})), where the URL is a PROPERTY, not a positional arg. GATED on a
+// sibling `method` HTTP-verb literal: that excludes SPA router configs ({ path:"/x", component }) which
+// share the path-property shape but never carry a method. Returns the path property's value NODE as
+// sinkInfo.urlNode (getSinkArgumentNode returns urlNode directly, so no positional index is needed).
+restConfigSink(node) {
+    const URLPROPS = ["url", "path", "fullPath", "uri", "endpoint"];
+    const keyOf = (p) => (p && p.type === "Property" && !p.computed && p.key)
+        ? (p.key.type === "Identifier" ? p.key.name : (p.key.type === "Literal" ? String(p.key.value) : "")) : "";
+    for (const arg of node.arguments || []) {
+        if (!arg || arg.type !== "ObjectExpression") continue;
+        let methodOk = false, urlNode = null;
+        for (const p of arg.properties) {
+            const k = keyOf(p);
+            if (k === "method" && this.verbOfNode(p.value)) methodOk = true;   // "GET" literal or HttpMethod.GET enum
+            else if (!urlNode && URLPROPS.includes(k) && this.isPathLikeNode(p.value)) urlNode = p.value;
+        }
+        if (methodOk && urlNode) return { name: "rest.config", urlNode };
+    }
+    return null;
+}
+,
+
+// Positional (method, path) dispatch: a call with an ADJACENT verb + path pair, in EITHER order, where the
+// verb is a string literal OR an enum member (HttpMethod.GET) and the path is a concrete route OR a
+// variable. Covers square's builder(cfg,cfg,"POST","/v2/subscriptions"), stripeMethod("GET","/v1/x"), and
+// openapi-generator's makeRequestContext(localVarPath, HttpMethod.GET). The general form of the built-in
+// xhr.open(method, url). The verb is the low-FP discriminator; a non-path resolved value is dropped by
+// getSortedResultRows' route-shape filter, so the loose (verb, <expr>) match stays precise.
+positionalVerbPathSink(node) {
+    const args = node.arguments || [];
+    let fallback = null;   // a (verb, <variable>) pair — used only if no concrete route pair is found, so a
+                           // config object adjacent to the verb (square: builder(cfg,cfg,"POST","/v2/x"))
+                           // can't win over the real "/v2/x" that follows.
+    for (let i = 0; i + 1 < args.length; i++) {
+        const a = args[i], b = args[i + 1];
+        const path = this.verbOfNode(a) && !this.verbOfNode(b) ? b
+                   : this.verbOfNode(b) && !this.verbOfNode(a) ? a : null;
+        if (!path) continue;
+        if (this.isPathLikeNode(path)) return { name: "rest.method", urlNode: path };   // concrete route wins
+        if (!fallback && this.isPathCandidateNode(path)) fallback = path;                // else remember the variable
+    }
+    return fallback ? { name: "rest.method", urlNode: fallback } : null;
+}
+,
+
 isSinkCall(node, scope, pos) {
     if (!node || node.type !== "CallExpression") return null;
     const callee = node.callee;
+    // Callee-agnostic dispatch sinks (fire for axios(config), this.request({...}), stripeMethod(...),
+    // and minified (0,f)(...) builder calls alike). Both are method-verb-gated, so they never shadow a
+    // plain positional string sink (fetch(url), etc.) — those calls carry no HTTP-verb literal.
+    const cfg = this.restConfigSink(node);
+    if (cfg) return cfg;
+    const pvp = this.positionalVerbPathSink(node);
+    if (pvp) return pvp;
 
     const lookupPos = typeof pos === "number" ? pos : (node.start || 0);
 
@@ -255,16 +382,25 @@ isSinkCall(node, scope, pos) {
     }
 
     if (callee.type === "MemberExpression") {
+        const propName = this.resolveSinkMemberPropName(callee, scope, lookupPos);
+        // REST-client dispatch: <recv>.get|post|put|patch|delete|request("/path"[, ...]). Qualified by a
+        // leading-slash path ARGUMENT, NOT the receiver — so it fires on custom SDK/axios-instance clients
+        // (this.post("/v1/..."), client.get(...), b.uE.get("/api/...")) that aren't in the known-receiver
+        // set (axios/$/http). The slash filter is what keeps non-HTTP verbs out: Map.get(k), _.get(o,"a.b"),
+        // cache.delete(k), emitter.post(msg) — their arg0 doesn't start with "/". Runs BEFORE the this.*
+        // bail below so this.post("/path") is caught. Emits the path (study scores path-template recall).
+        if (/^(get|post|put|patch|delete|request)$/i.test(propName) && this.hasLeadingSlashPathArg(node, 0)) {
+            return { name: `rest.${propName.toLowerCase()}`, urlArgIndex: 0 };
+        }
         if (callee.object && callee.object.type === "ThisExpression") return null;
         const objName = this.getName(callee.object);
-        const propName = this.resolveSinkMemberPropName(callee, scope, lookupPos);
         const memberSink = this.resolveMemberSink(objName, propName, scope, lookupPos);
         if (memberSink) return memberSink;
         // XMLHttpRequest.open(method, url)
         if (propName === "open" && node.arguments && node.arguments.length >= 2) {
             const firstArg = node.arguments[0];
             if (firstArg && firstArg.type === "Literal" && typeof firstArg.value === "string" &&
-                /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$/i.test(firstArg.value)) {
+                HTTP_VERB_RE.test(firstArg.value)) {
                 return { name: "xhr.open", urlArgIndex: 1 };
             }
         }
@@ -335,17 +471,23 @@ handleEventListener(handlerInfo, node, scope, walk, fnScope, position) {
 
 _walkEventHandler(fnNode, scope, walk) {
     if (!fnNode) return;
-    const fnScope = this.createScope(scope);
-    this.fnScopeMap.set(fnNode, fnScope);
-    const params = fnNode.params || [];
-    params.forEach(param => {
-        if (param.type === "Identifier") fnScope.paramNames.add(param.name);
-        if (param.type === "AssignmentPattern" && param.left && param.left.type === "Identifier") {
-            fnScope.paramNames.add(param.left.name);
-        }
-    });
-    const body = fnNode.body && fnNode.body.type === "BlockStatement" ? fnNode.body.body : [fnNode.body];
-    body.filter(Boolean).forEach(child => walk(child, fnScope, fnNode));
+    // Register the callback's function scope, but do NOT re-walk its body: the main traversal already walks
+    // every function body exactly once (an inline callback is an ordinary CallExpression argument; a named
+    // one is walked at its definition). Re-walking here double-processed the body, and for NESTED event
+    // listeners that doubling compounded to 2^depth — a shared subtree was re-visited tens of thousands of
+    // times, making index() effectively non-terminating on some bundles. `walk` is now unused but kept in
+    // the signature so callers are unchanged.
+    if (!this.fnScopeMap.has(fnNode)) {
+        const fnScope = this.createScope(scope);
+        this.fnScopeMap.set(fnNode, fnScope);
+        const params = fnNode.params || [];
+        params.forEach(param => {
+            if (param.type === "Identifier") fnScope.paramNames.add(param.name);
+            if (param.type === "AssignmentPattern" && param.left && param.left.type === "Identifier") {
+                fnScope.paramNames.add(param.left.name);
+            }
+        });
+    }
 }
 ,
 
@@ -356,7 +498,16 @@ index() {
         return scope;
     };
 
-    const walk = (node, scope, parent) => {
+    const stack = [];
+    // Per-property-key Set of literal values already stored under the general ".prop" key, so the dedup
+    // below is O(1) instead of an O(n²) rescan of the whole list (see the push site for why that mattered).
+    const propKeySeen = new Map();
+    // Deferred/iterative traversal: `walk` only enqueues; `process` does the per-node work. This
+    // replaces native recursion so deeply-nested ASTs (long +/||/method chains in minified bundles)
+    // can't overflow the call stack. Children are pushed in reverse so they pop in source order —
+    // an identical pre-order DFS to the former recursion (results verified byte-identical).
+    const walk = (node, scope, parent) => { if (node && typeof node === "object") stack.push([node, scope, parent]); };
+    const visit = (node, scope, parent) => {   // NB: not named `process` — that shadows the global `process` (env checks below)
         if (!node || typeof node !== "object") return;
         this.scopeMap.set(node, scope);
         this.parentMap.set(node, parent || null);
@@ -445,14 +596,25 @@ index() {
                 if (!this.memberAssignments.has(propKey)) {
                     this.memberAssignments.set(propKey, []);
                 }
-                // Only add if not already there (prefer explicit var.prop over just .prop)
-                const existing = this.memberAssignments.get(propKey);
-                if (!existing.some(a => a.value === node.right.value)) {
+                // Dedup a repeated literal value under the general ".prop" key. This used to be
+                // `existing.some(a => a.value === node.right.value)` — an O(n²) linear rescan of the whole
+                // list per assignment. Minified bundles assign the same short prop name (`.a`, `.p`, …)
+                // tens of thousands of times, so index() went quadratic and hung — and index() charges no
+                // op-budget, so nothing capped it. A per-key Set makes it O(1). Semantics are unchanged:
+                // string-literal values dedup on first occurrence; non-literal RHS (value === null) never
+                // matched the old scan (null !== node.right.value), so those are always appended.
+                let pushGeneral = true;
+                if (value !== null) {
+                    let seen = propKeySeen.get(propKey);
+                    if (!seen) { seen = new Set(); propKeySeen.set(propKey, seen); }
+                    if (seen.has(value)) pushGeneral = false; else seen.add(value);
+                }
+                if (pushGeneral) {
                     this.memberAssignments.get(propKey).push({ value, node: node.right, pos: node.start || 0, isGeneral: true, ...meta });
                 }
                 
                 if (process.env.DEBUG_MEMBER) {
-                    console.error(`[INDEX] MEMBER_ASSIGN: ${memberKey} = "${node.right.value}"`);
+                    console.error(`[INDEX] MEMBER_ASSIGN: ${memberKey} = ${JSON.stringify(value)}`);
                 }
             }
             
@@ -635,14 +797,14 @@ index() {
                         // Register as a def (not paramName) so it resolves through the argument
                         this.addDef(fnScope, paramName, argNode, node.start || 0);
                         // Track well-known global aliases for document/window
-                        if (argNode.type === "Identifier" && (argNode.name === "document" || argNode.name === "window" || argNode.name === "this" || argNode.name === "self" || argNode.name === "globalThis")) {
+                        if (argNode.type === "Identifier" && GLOBAL_NAMES.has(argNode.name)) {
                             this.iifeAliases.set(paramName, argNode.name);
                         }
                     } else {
                         // No argument provided — treat as param
                         fnScope.paramNames.add(paramName);
                         if (param.type === "AssignmentPattern" && param.right && param.right.type === "Identifier" &&
-                            (param.right.name === "document" || param.right.name === "window" || param.right.name === "this" || param.right.name === "self" || param.right.name === "globalThis")) {
+                            GLOBAL_NAMES.has(param.right.name)) {
                             this.iifeAliases.set(paramName, param.right.name);
                             this.addDef(fnScope, paramName, param.right, node.start || 0);
                         }
@@ -658,7 +820,7 @@ index() {
                 });
             }
             const body = node.body && node.body.type === "BlockStatement" ? node.body.body : [node.body];
-            body.filter(Boolean).forEach(child => walk(child, fnScope, node));
+            { const b = body.filter(Boolean); for (let i = b.length - 1; i >= 0; i--) walk(b[i], fnScope, node); }
             return;
         }
 
@@ -673,20 +835,36 @@ index() {
                 }
             });
             const body = node.value.body && node.value.body.type === "BlockStatement" ? node.value.body.body : [node.value.body];
-            body.filter(Boolean).forEach(child => walk(child, fnScope, node.value));
+            { const b = body.filter(Boolean); for (let i = b.length - 1; i >= 0; i--) walk(b[i], fnScope, node.value); }
             return;
         }
 
+        // Enqueue only real AST children: objects carrying a string `.type` (ESTree nodes), or arrays of
+        // them. This deliberately skips acorn's location bookkeeping (`loc` and its `start`/`end` Position
+        // objects, plus numeric `start`/`end`/`range`). Those aren't AST nodes and hold no sink info — and
+        // in some concatenated bundles acorn SHARES Position objects across many nodes, so the old
+        // "descend into every enumerable key" walk re-traversed that shared metadata combinatorially (a
+        // single Position object was re-visited 25k+ times), making index() effectively non-terminating.
+        const kids = [];
         for (const key in node) {
-            if (key === "parent") continue;
+            if (key === "parent" || key === "loc") continue;
             const child = node[key];
-            if (Array.isArray(child)) child.forEach(c => walk(c, scope, node));
-            else walk(child, scope, node);
+            if (Array.isArray(child)) { for (const c of child) if (c && typeof c.type === "string") kids.push(c); }
+            else if (child && typeof child.type === "string") kids.push(child);
         }
+        for (let i = kids.length - 1; i >= 0; i--) walk(kids[i], scope, node);   // reverse -> pop in source order
     };
 
     const rootScope = this.createScope(null);
     walk(this.ast, rootScope, null);
+    // Node-visit budget: if the walk blows past indexBudget, stop on the PARTIALLY-indexed tree. The scopes,
+    // defs, and sinks collected so far stay valid, so analyze() still resolves whatever sinks were reached —
+    // a partial file result instead of a hang. _budgetHit is the shared "results are partial" signal.
+    let visits = 0;
+    while (stack.length) {
+        if (this.indexBudget && ++visits > this.indexBudget) { this._indexBudgetHit = true; this._budgetHit = true; break; }
+        const [n, s, p] = stack.pop(); visit(n, s, p);
+    }
 }
 ,
 
@@ -716,17 +894,6 @@ findPrevDef(scope, name, pos) {
     }
     return null;
 }
-,
-
-cartesianConcat(left, right) {
-    const results = new Set();
-    left.forEach(l => {
-        right.forEach(r => {
-            results.add(`${l}${r}`);
-        });
-    });
-    return [...results].slice(0, this.maxCombos);
-}
-,
+// NB: cartesianConcat lives in analyze.js (assigned last in LyNX.js, so it wins) — no duplicate here.
 
 };

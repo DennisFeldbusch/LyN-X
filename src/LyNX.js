@@ -6,6 +6,7 @@ const runtime = require("./core/runtime");
 const callgraph = require("./core/callgraph");
 const resolve = require("./core/resolve");
 const analyze = require("./core/analyze");
+const { OP_BUDGET, TOTAL_BUDGET, INDEX_BUDGET, MAX_COMBOS } = require("./core/shared");
 
 class LyNX {
     constructor(input) {
@@ -14,7 +15,14 @@ class LyNX {
         this.code = typeof input === "string" ? fs.readFileSync(input, "utf8") : input.code;
         this.ast = this.parseCode(this.code);
         this.results = new Set();
-        this.maxCombos = 8000;
+        this.maxCombos = MAX_COMBOS;
+        // Per-run work budgets (see core/shared.js). Instance-level so a caller (e.g. the CLI's
+        // --op-budget/--index-budget flags) can raise or disable them per file; default to the shared
+        // env-aware constants. opBudget = per-sink resolver cap; totalBudget = whole-file resolver cap;
+        // indexBudget = AST-node-visit cap for the indexing walk.
+        this.opBudget = OP_BUDGET;
+        this.totalBudget = TOTAL_BUDGET;
+        this.indexBudget = INDEX_BUDGET;
         this.scopeId = 0;
         this.scopeMap = new WeakMap();
         this.fnScopeMap = new WeakMap();
@@ -33,72 +41,8 @@ class LyNX {
         this.varDomains = new Map(); // Map of variable names to their resolved domain values
         this.memberAssignments = new Map(); // Track literal assignments like l.p = "/client/"
         
-        // Extract all URL-like string literals from the code for fallback resolution
-        this.urlLiterals = this.extractUrlLiterals();
-        
         // Auto-extract webpack runtime configuration from minified code
         this.extractWebpackConfig();
-    }
-
-    extractUrlLiterals() {
-        const urls = new Set();
-        
-        // Filesystem paths that are NOT web URLs
-        const NOT_WEB_PATHS = [
-            /^\/dev\//,
-            /^\/home\//,
-            /^\/tmp\//,
-            /^\/proc\//,
-            /^\/var\//,
-            /^\/etc\//,
-            /^\/usr\//,
-            /^\/bin\//,
-            /^\/sbin\//,
-            /^\/lib\//,
-            /^\/sys\//,
-        ];
-        
-        const walk = (node) => {
-            if (!node || typeof node !== "object") return;
-            
-            // Look for string literals that are likely URLs or paths
-            if (node.type === "Literal" && typeof node.value === "string") {
-                const val = node.value;
-                
-                // Check if it's a filesystem path (not a web URL)
-                const isFilesystemPath = NOT_WEB_PATHS.some(pattern => pattern.test(val));
-                if (isFilesystemPath) {
-                    // Skip filesystem paths
-                } 
-                // Paths starting with / that are likely web resources
-                else if (val.startsWith("/") && val.length > 2 && !val.includes("(") && !val.includes(")")) {
-                    urls.add(val);
-                }
-                // Full URLs (http/https)
-                else if (/^https?:\/\/[\w\-._~:/?#[\]@!$&'()*+,;=%]+$/.test(val)) {
-                    urls.add(val);
-                }
-                // Protocol-relative URLs
-                else if (/^\/\/[\w\-._~:/?#[\]@!$&'()*+,;=%]+$/.test(val)) {
-                    urls.add(val);
-                }
-                // UUIDs (might be used in URLs)
-                else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) {
-                    urls.add(val);
-                }
-            }
-            
-            // Recurse into all properties
-            for (const key in node) {
-                if (key === "parent" || key === "loc" || key === "range") continue;
-                const child = node[key];
-                if (Array.isArray(child)) child.forEach(c => walk(c));
-                else if (typeof child === "object") walk(child);
-            }
-        };
-        
-        walk(this.ast);
-        return urls;
     }
 
     parseCode(code) {
@@ -155,6 +99,25 @@ class LyNX {
     }
 
 }
+
+// The analyzer's methods are composed by mixing five core modules onto the prototype. This is order-
+// sensitive: if two modules export the same method name, the LATER one silently wins (e.g. analyze's
+// cartesianConcat is meant to override any earlier definition). A silent collision is otherwise a
+// debugging trap, so assert that the only overrides are intentional and surface any accidental ones.
+const MIXINS = { indexing, runtime, callgraph, resolve, analyze };
+const INTENTIONAL_OVERRIDES = new Set([]); // add "name" here if a later module is meant to shadow an earlier one
+(function assertNoMixinCollisions() {
+    const owner = new Map();
+    for (const [modName, mod] of Object.entries(MIXINS)) {
+        for (const key of Object.keys(mod)) {
+            if (owner.has(key) && !INTENTIONAL_OVERRIDES.has(key)) {
+                console.warn(`[LyNX] mixin collision: "${key}" defined in both ${owner.get(key)} and ${modName} ` +
+                    `— ${modName} wins. Rename one, or add "${key}" to INTENTIONAL_OVERRIDES.`);
+            }
+            owner.set(key, modName);
+        }
+    }
+})();
 
 Object.assign(
     LyNX.prototype,
