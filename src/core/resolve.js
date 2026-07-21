@@ -501,6 +501,17 @@ getSinkArgumentNode(node, sinkInfo, scope, pos) {
 
 buildQueryStrings(entries) {
     if (!entries || entries.length === 0) return [""];
+    // Semantic collapse: a maximal RUN of query params with an identical (keys, values) signature is the
+    // tool eagerly enumerating a repeated `&k=v` pattern — e.g. N copies of `&lbid=(getAttr()|null)` — whose
+    // cartesian product blows up to 2^N genuinely-distinct strings that exact-string dedup can't merge.
+    // Repeated identical params add no endpoint structure, so fold each run to ONE entry. Distinct repeated
+    // keys (`?id=1&id=2`) have different value signatures and survive.
+    if (entries.length > 2) {
+        const sig = (e) => JSON.stringify([e.keyValues, e.valueValues]);
+        const folded = []; let prev = null;
+        for (const e of entries) { const s = sig(e); if (s === prev) continue; prev = s; folded.push(e); }
+        entries = folded;
+    }
     const cap = this.maxCombos || 8000;
     let combos = [""];
     entries.forEach(entry => {

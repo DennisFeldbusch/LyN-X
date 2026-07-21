@@ -747,16 +747,18 @@ index() {
                 if (propName === "setAttribute" && objName) {
                     const attrNode = node.arguments && node.arguments[0];
                     const valueNode = node.arguments && node.arguments[1];
-                    if (attrNode && attrNode.type === "Literal" && (attrNode.value === "src" || attrNode.value === "href")) {
+                    if (attrNode && attrNode.type === "Literal" && (attrNode.value === "src" || attrNode.value === "href") && valueNode) {
+                        // el.setAttribute("src"/"href", url) is a URL sink just like el.src = url. Use the element
+                        // kind when known (script/link/img/...); otherwise fall back to the attribute name, so a
+                        // setAttribute on a createElement(<variable-tag>) element (the GTM/pixel-loader idiom,
+                        // whose tag lynx can't statically resolve) is still recorded — matching the direct-.src path.
                         const kind = this.elementKinds.get(objName);
-                        if (kind && valueNode) {
-                            this.addElementUrl(objName, { node: valueNode, scope, pos: node.start || 0 });
-                            this.sinks.push({
-                                node,
-                                scope,
-                                sinkInfo: { name: kind, urlNode: valueNode }
-                            });
-                        }
+                        if (kind) this.addElementUrl(objName, { node: valueNode, scope, pos: node.start || 0 });
+                        this.sinks.push({
+                            node,
+                            scope,
+                            sinkInfo: { name: kind || String(attrNode.value), urlNode: valueNode }
+                        });
                     }
                 }
                 if (propName === "appendChild" || propName === "append" || propName === "insertBefore") {

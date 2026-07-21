@@ -1,11 +1,18 @@
+const { MAX_VARIANTS_PER_STRUCT } = require("./shared");
+
 module.exports = {
 
 recordInterproceduralSink(entry, overrides, runtimeEnv) {
     const arg = this.getSinkArgumentNode(entry.node, entry.sinkInfo, entry.scope, entry.node.start || 0);
     const pos = entry.node.start || 0;
     const values = this.resolveExpression(arg, entry.scope, pos, overrides || new Map(), runtimeEnv);
+    const structCount = new Map();                            // over-generation guard (see recordResolvedSinkValues)
     values.forEach(val => {
         if (!val) return;
+        const sk = this.structuralKey(val);
+        const c = structCount.get(sk) || 0;
+        if (c >= MAX_VARIANTS_PER_STRUCT) return;
+        structCount.set(sk, c + 1);
         const loc = entry.node.loc && entry.node.loc.start ? entry.node.loc.start : null;
         const line = loc ? loc.line : 0;
         const col = loc ? loc.column + 1 : 0;                 // 1-based char position of the sink

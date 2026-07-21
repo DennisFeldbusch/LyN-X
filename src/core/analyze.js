@@ -1,7 +1,7 @@
 // Resolver budgets are instance props (this.opBudget / this.totalBudget), set from core/shared.js in the
 // LyNX ctor and overridable via the CLI's --op-budget / --total-budget flags. String-length limits
 // (MAX_VALUE_LEN / LEN_CHARGE_FLOOR) are shared with resolve.js's deduplicateAndCap.
-const { MAX_VALUE_LEN, LEN_CHARGE_FLOOR } = require("./shared");
+const { MAX_VALUE_LEN, LEN_CHARGE_FLOOR, MAX_VARIANTS_PER_STRUCT } = require("./shared");
 
 module.exports = {
 
@@ -91,24 +91,42 @@ recordResolvedSinkValues(entry, overrides) {
     const runtimeEnv = this.getRuntimeEnvForNodeChain(node);
     const values = this.resolveExpression(arg, scope, pos, overrides || new Map(), runtimeEnv);
     this._totalOps = (this._totalOps || 0) + (this._ops || 0);   // accumulate toward the whole-file ceiling
+    // Over-generation guard: a chain of optional appends (`M && (i.src += "&lbid=" + M)`, repeated N times)
+    // makes one sink resolve to 2^N strings that are the SAME endpoint structure differing only by which
+    // optional/duplicate query params are present. They're genuinely distinct (exact-dedup can't merge them)
+    // but carry no new endpoint. Cap the number of variants sharing a structural key (base + distinct query
+    // keys) so normal path-sensitive variety (<= cap) is fully preserved but explosions collapse to a few.
+    const structCount = new Map();
     values.forEach(val => {
         if (!val) return;
-        
-        // Filter out excluded URLs
-        if (this.isExcludedUrl(val)) {
-            return;
-        }
-        
-        // Filter out excluded call results  
-        if (val.startsWith("{EXCLUDED_CALL:")) {
-            return;
-        }
-        
+        if (this.isExcludedUrl(val)) return;                 // filter excluded URLs
+        if (val.startsWith("{EXCLUDED_CALL:")) return;       // filter excluded call results
+        const sk = this.structuralKey(val);
+        const c = structCount.get(sk) || 0;
+        if (c >= MAX_VARIANTS_PER_STRUCT) return;            // enough representatives of this structure already
+        structCount.set(sk, c + 1);
         const loc = node.loc && node.loc.start ? node.loc.start : null;
         const line = loc ? loc.line : 0;
         const col = loc ? loc.column + 1 : 0;                 // 1-based char position of the sink
         this.results.add(`${line}|${col}|${sinkInfo.name}|${val}`);
     });
+}
+,
+
+// structural key = base url + the DISTINCT query-parameter keys (placeholders normalised, values/dupes
+// dropped). Strings that differ only by which optional/repeated query params they carry, or by param values,
+// collapse to one key; different hosts/paths/param-sets stay distinct.
+structuralKey(u) {
+    const s = u.replace(/\{[A-Z_]+:[^}]*\}/g, "{}");
+    const qi = s.search(/[?&]/);
+    if (qi < 0) return s;
+    const seen = new Set(), keys = [];
+    for (const part of s.slice(qi).split(/[?&]/)) {
+        if (!part) continue;
+        const k = part.split("=")[0];
+        if (!seen.has(k)) { seen.add(k); keys.push(k); }
+    }
+    return s.slice(0, qi) + "?" + keys.join("&");
 }
 ,
 
