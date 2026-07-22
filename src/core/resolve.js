@@ -3,7 +3,7 @@ const DEBUG_VAR = process.env.DEBUG_VAR === '1';
 
 // The per-sink resolver budget is this.opBudget (set from core/shared.js in the LyNX ctor, CLI-overridable);
 // collectReturns is shared with runtime.js. LEN_CHARGE_FLOOR gates the length surcharge in deduplicateAndCap.
-const { collectReturns, LEN_CHARGE_FLOOR } = require("./shared");
+const { collectReturns, LEN_CHARGE_FLOOR, ARITY_CAP } = require("./shared");
 
 // Known functions that return URLs or URL-like values
 const URL_RETURNING_FUNCTIONS = {
@@ -121,8 +121,13 @@ resolveIdentifier(name, scope, pos, overrides, runtimeEnv) {
     }
     
     if (scope && scope.paramNames && scope.paramNames.has(name)) {
-        if (DEBUG_VAR) console.error(`[RESOLVE] PARAM: ${name} (scope ${scopeId})`);
-        return [`{VAR:${name}}`];
+        // Params are substituted via overrides (checked above); an unbound one is {VAR:name} — UNLESS the
+        // runtime env bound it (an arr.forEach(u => ...) / .map element param, or a param reassigned in the
+        // body), in which case fall through to the runtimeEnv block below to use those values.
+        if (!(runtimeEnv && runtimeEnv.values.has(name))) {
+            if (DEBUG_VAR) console.error(`[RESOLVE] PARAM: ${name} (scope ${scopeId})`);
+            return [`{VAR:${name}}`];
+        }
     }
     if (runtimeEnv && runtimeEnv.values.has(name)) {
         const vals = [...runtimeEnv.values.get(name)];
@@ -520,20 +525,26 @@ buildQueryStrings(entries) {
         // whose key/value resolved to many candidates makes either explode, and the old code built the
         // FULL product before capping — seconds of wasted string work per sink. Cap both at `cap` (the
         // result is deduped/capped to maxCombos anyway) so a single call stays O(cap), not O(product).
-        const pairs = [];
+        const pairs = [], pairAr = [];
         for (const k of entry.keyValues) {
             if (pairs.length >= cap) break;
             for (const v of entry.valueValues) {
                 if (pairs.length >= cap) break;
                 pairs.push(`${k}=${v}`);
+                if (this._arity) pairAr.push(this._arity.get(v) || 1);   // this param counts pieces(v)
             }
         }
         const next = [];
         for (const prefix of combos) {
             if (next.length >= cap) break;
-            for (const pair of pairs) {
+            for (let pi = 0; pi < pairs.length; pi++) {
                 if (next.length >= cap) break;
-                next.push(prefix ? `${prefix}&${pair}` : pair);
+                const s = prefix ? `${prefix}&${pairs[pi]}` : pairs[pi];
+                if (this._arity) {
+                    const a = Math.min(ARITY_CAP, (prefix ? (this._arity.get(prefix) || 1) : 0) + pairAr[pi]);
+                    if (a > (this._arity.get(s) || 0)) this._arity.set(s, a);
+                }
+                next.push(s);
             }
         }
         combos = this.deduplicateAndCap(next);
