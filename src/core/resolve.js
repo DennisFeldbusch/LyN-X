@@ -1335,7 +1335,11 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             };
             collectBranches(node.consequent);
             collectBranches(node.alternate);
-            return this.deduplicateAndCap(allBranches.filter(v => v !== ""));
+            // Keep "" branches: a ternary like `cond ? "-uat" : ""` inside a concatenation has a REAL
+            // empty branch (here the prod host `cale.advance.net` vs UAT `cale-uat.advance.net`). Pruning
+            // it here drops a constructible host (soundness bug). Bare empty results are still dropped at
+            // emission (analyze.js: `if (!val) return`), so this only affects concat context.
+            return this.deduplicateAndCap(allBranches);
         }
         case "LogicalExpression": {
             const left = this.resolveExpression(node.left, scope, pos, overrides, runtimeEnv);
