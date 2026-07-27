@@ -1,7 +1,7 @@
 // Resolver budgets are instance props (this.opBudget / this.totalBudget), set from core/shared.js in the
 // LyNX ctor and overridable via the CLI's --op-budget / --total-budget flags. String-length limits
 // (MAX_VALUE_LEN / LEN_CHARGE_FLOOR) are shared with resolve.js's deduplicateAndCap.
-const { MAX_VALUE_LEN, LEN_CHARGE_FLOOR, MAX_VARIANTS_PER_STRUCT } = require("./shared");
+const { MAX_VALUE_LEN, LEN_CHARGE_FLOOR, MAX_VARIANTS_PER_STRUCT, ARITY_CAP } = require("./shared");
 
 module.exports = {
 
@@ -39,6 +39,10 @@ cartesianConcat(left, right) {
         // Drop runaway strings: past MAX_VALUE_LEN it's not a URL, and keeping it makes every downstream
         // concat/Set-dedup do multi-KB string work per element — the interproc hot path (StringEqual).
         if (combined.length > MAX_VALUE_LEN) return;
+        if (this._arity) {                                   // construction arity = pieces(l) + pieces(r); leaves default to 1
+            const a = Math.min(ARITY_CAP, (this._arity.get(l) || 1) + (this._arity.get(r) || 1));
+            if (a > (this._arity.get(combined) || 0)) this._arity.set(combined, a);
+        }
         if (!seen.has(combined)) { seen.add(combined); result.push(combined); }
     };
 
@@ -158,7 +162,9 @@ getSortedResultRows() {
             // REST-dispatch sinks may carry a combined "VERB /path" route string (e.g. octokit
             // request("GET /repos/{owner}/{repo}")) — strip the method so the value is just the path.
             if (sink.startsWith("rest.")) url = url.replace(VERB_PREFIX, "");
-            return { line: Number(parts[0]), col: Number(parts[1]), sink, url };
+            const row = { line: Number(parts[0]), col: Number(parts[1]), sink, url };
+            if (this._arity) row.arity = this._arity.get(url) || 1;   // # source fragments concatenated (research)
+            return row;
         })
         // The generalized REST sinks fire on loose (verb, <expr>) / (<expr>, verb) shapes where the path is
         // a variable; keep only genuinely route-shaped results so a non-path arg can't leak (protects precision).

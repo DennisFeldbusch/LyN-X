@@ -15,6 +15,13 @@ class LyNX {
         this.code = typeof input === "string" ? fs.readFileSync(input, "utf8") : input.code;
         this.ast = this.parseCode(this.code);
         this.results = new Set();
+        // RESEARCH-ONLY construction-arity tracking (env LYNX_TRACK_ARITY=1; off by default so it never runs
+        // in the shipped tool). When on, _arity maps each built string -> how many source fragments were
+        // concatenated to form it (a leaf literal/placeholder = 1, `a+b` = arity(a)+arity(b)); exposed as an
+        // `arity` field on --json rows. Captures construction depth EVEN when everything resolves to literals
+        // (which the final string can't reveal) — motivating a reconstruction-capable tool.
+        this.trackArity = process.env.LYNX_TRACK_ARITY === "1";
+        this._arity = this.trackArity ? new Map() : null;
         this.maxCombos = MAX_COMBOS;
         // Per-run work budgets (see core/shared.js). Instance-level so a caller (e.g. the CLI's
         // --op-budget/--index-budget flags) can raise or disable them per file; default to the shared

@@ -174,6 +174,14 @@ resolveExpressionRuntime(node, env, pos=0) {
                         }
                     });
                     if (resolved.length > 0) return [...new Set(resolved)];
+                    // Opaque index -> bounded union of ALL elements (mirrors static resolveComputedArrayWiden;
+                    // covers arr[i] evaluated inside an interpreted loop/branch body).
+                    if (elements.length) {
+                        const cap = Math.min(this.maxCombos || 8000, 512);
+                        const widened = [];
+                        for (const evs of elements) { for (const v of (evs || [])) { widened.push(v); if (widened.length >= cap) break; } if (widened.length >= cap) break; }
+                        if (widened.length) return [...new Set(widened)];
+                    }
                 }
             }
             // Handle inline ObjectExpression computed access: ({key:val,...})[param]
@@ -196,8 +204,8 @@ resolveExpressionRuntime(node, env, pos=0) {
                             }
                         });
                     });
-                    // If key is placeholder, return all values
-                    if (resolved.length === 0 && keyValues.some(v => typeof v === "string" && v.startsWith("{VAR:"))) {
+                    // If key is an opaque placeholder ({VAR:}/{CALL:}/...), return ALL values (bounded widening).
+                    if (resolved.length === 0 && keyValues.some(v => typeof v === "string" && /^\{[A-Z_]+:/.test(v))) {
                         entries.forEach(entry => {
                             this.resolveExpressionRuntime(entry.valueNode, env, pos)
                                 .forEach(val => resolved.push(val));

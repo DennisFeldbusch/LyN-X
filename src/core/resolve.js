@@ -437,7 +437,10 @@ resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv) {
             }
         });
     });
-    if (resolved.length === 0 && keyValues.some(val => typeof val === "string" && val.startsWith("{VAR:"))) {
+    // Opaque key (any {VAR:}/{CALL:}/{URL_CALL:} placeholder) that matched no entry -> widen to the union of
+    // ALL values. Each is a possible endpoint (sound over-approximation); was previously {VAR:}-only, which
+    // missed obj[fn()] / obj[cond?a:b] etc.
+    if (resolved.length === 0 && keyValues.some(val => typeof val === "string" && /^\{[A-Z_]+:/.test(val))) {
         if (DEBUG_VAR) console.error(`[OBJ_MAP] Key is unresolved, returning all values`);
         entries.forEach(entry => {
             this.resolveExpression(entry.valueNode, scope, pos, overrides, runtimeEnv)
@@ -475,6 +478,37 @@ resolveArrayElementsFromNode(node, scope, pos, overrides, runtimeEnv) {
         }
     }
     return [];
+}
+,
+
+// Computed array/list access `arr[i]` where `arr` is (or resolves to) an array literal. A concrete index
+// yields that element; an OPAQUE index widens to the BOUNDED union of every entry. This is a sound
+// over-approximation for URL extraction: each entry is an endpoint the script may load, so we emit the whole
+// set rather than a bare {VAR:i} placeholder — recovering manifest/chunk-list/route-table lookups that regex
+// greps as literals but backward taint otherwise loses at the indexing step. (Object-literal maps `obj[k]`
+// are handled by resolveMemberFromObjectMap, which already widens on an unresolved key.) Bounded by maxCombos
+// (capped) so a large data array can't explode output; non-URL entries are dropped later at emission.
+resolveComputedArrayWiden(node, scope, pos, overrides, runtimeEnv) {
+    if (!node || node.type !== "MemberExpression" || !node.computed) return null;
+    const elemLists = this.resolveArrayElementsFromNode(node.object, scope, pos, overrides, runtimeEnv);
+    if (!elemLists.length) return null;                        // not an array literal (objects handled elsewhere)
+    // Concrete integer index -> that element only (precise, no widening).
+    const idxVals = this.resolveExpression(node.property, scope, pos, overrides, runtimeEnv);
+    const concrete = [];
+    for (const iv of idxVals) {
+        const n = typeof iv === "number" ? iv
+            : (typeof iv === "string" && /^\d+$/.test(iv.trim()) ? parseInt(iv, 10) : null);
+        if (n != null && n >= 0 && n < elemLists.length && elemLists[n]) elemLists[n].forEach(v => concrete.push(v));
+    }
+    if (concrete.length) return this.deduplicateAndCap(concrete);
+    // Opaque index -> bounded widening over ALL entries.
+    const cap = Math.min(this.maxCombos || 8000, 512);
+    const out = [];
+    for (const evs of elemLists) {
+        for (const v of evs) { out.push(v); if (out.length >= cap) break; }
+        if (out.length >= cap) break;
+    }
+    return out.length ? this.deduplicateAndCap(out) : null;
 }
 ,
 
@@ -1359,6 +1393,15 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
                     console.error(`[RESOLVE] MEMBER_MAP: ${name} = ${mapResolved.join(", ")}`);
                 }
                 return mapResolved;
+            }
+            // Computed array/list index arr[i]: concrete element, or bounded union of all entries when the
+            // index is opaque (sound over-approximation — every entry is a possible endpoint).
+            if (node.computed) {
+                const arrWiden = this.resolveComputedArrayWiden(node, scope, pos, overrides, runtimeEnv);
+                if (arrWiden && arrWiden.length) {
+                    if (DEBUG_VAR) console.error(`[RESOLVE] ARRAY_WIDEN: ${this.getName(node)} = ${arrWiden.length} entries`);
+                    return arrWiden;
+                }
             }
             if (node.object && node.object.type === "NewExpression") {
                 const calleeName = this.getName(node.object.callee);

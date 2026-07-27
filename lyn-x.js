@@ -55,8 +55,11 @@ Options:
       --base  URL     Base to CONCATENATE onto root-relative routes, preserving the base's own path
                       (e.g. .../v1); mirrors SDK baseURL+route. Unlike --origin, keeps the /v1 prefix
       --op-budget N     Per-sink resolver work cap (ops); raise for deep/complex sinks, 0 disables
+                        (default 2000000, env LYNX_OP_BUDGET)
       --index-budget N  Indexing-walk cap (AST-node visits); raise for very large bundles, 0 disables
+                        (default 15000000, env LYNX_INDEX_BUDGET)
       --total-budget N  Whole-file resolver work cap (ops); 0 disables
+                        (default 20000000, env LYNX_TOTAL_BUDGET)
                         Hitting any budget yields PARTIAL results (footer shows "(partial)").
       --stack-size N  Re-run with a larger V8 stack (KB) for very deep/large minified JS whose
                       parse recursion overflows. Keep below your OS thread stack ('ulimit -s',
