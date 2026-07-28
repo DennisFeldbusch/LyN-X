@@ -2,6 +2,37 @@ const { MAX_VARIANTS_PER_STRUCT } = require("./shared");
 
 module.exports = {
 
+// If `callEntry` sits inside an iteration callback — `arr.forEach(el => …)` or `arr.map(el => …)`, allowing a
+// trailing `.filter(...)`/`.slice(...)` on the receiver — return an overrides Map binding the callback's element
+// param to the receiver array's literal elements. Lets the interprocedural pass resolve
+// `[lit,lit].filter(Boolean).forEach(u => wrapper(u))` by flowing each element into `wrapper`.
+iterationElementOverrides(callEntry) {
+    const seed = new Map();
+    if (!callEntry || !callEntry.node) return seed;
+    const cb = this.findEnclosingFunction(callEntry.node);
+    if (!cb) return seed;
+    const call = this.parentMap.get(cb);
+    if (!call || call.type !== "CallExpression" || !call.callee || call.callee.type !== "MemberExpression") return seed;
+    const method = this.getName(call.callee.property);
+    if (method !== "forEach" && method !== "map") return seed;
+    if (!call.arguments || call.arguments[0] !== cb) return seed;      // cb must be the iteratee, not the receiver
+    let recv = call.callee.object;
+    let guard = 0;
+    while (recv && recv.type === "CallExpression" && recv.callee && recv.callee.type === "MemberExpression"
+           && ["filter", "slice"].includes(this.getName(recv.callee.property)) && guard++ < 4) {
+        recv = recv.callee.object;
+    }
+    const p0 = cb.params && cb.params[0];
+    const paramName = p0 && p0.type === "Identifier" ? p0.name
+        : (p0 && p0.type === "AssignmentPattern" && p0.left && p0.left.type === "Identifier" ? p0.left.name : "");
+    if (!paramName) return seed;
+    const lists = this.resolveArrayElementsFromNode(recv, callEntry.scope, callEntry.node.start || 0, new Map(), this.getRuntimeEnvForNodeChain(callEntry.node));
+    const vals = [];
+    for (const evs of lists || []) for (const v of evs) if (v != null) vals.push(v);
+    if (vals.length) seed.set(paramName, [...new Set(vals)]);
+    return seed;
+},
+
 recordInterproceduralSink(entry, overrides, runtimeEnv) {
     const arg = this.getSinkArgumentNode(entry.node, entry.sinkInfo, entry.scope, entry.node.start || 0);
     const pos = entry.node.start || 0;
@@ -144,7 +175,10 @@ resolveFunctionCallsInterprocedurally(entryCalls, sinksByFunction, callsByFuncti
         if (this._budgetHit) return;   // budget spent -> stop launching new entry-call traversals
         const fnNode = this.resolveCalledFunctionNode(callEntry);
         if (!fnNode) return;
-        const overrides = this.buildCallOverrides(fnNode, callEntry, new Map());
+        // Seed the call's argument resolution with the enclosing iteration's element bindings, so an element
+        // passed straight into a wrapper (forEach(u => wrapper(u))) is resolved.
+        const seed = this.iterationElementOverrides(callEntry);
+        const overrides = this.buildCallOverrides(fnNode, callEntry, seed);
         visit(fnNode, overrides, 0, new Set());
     });
 }

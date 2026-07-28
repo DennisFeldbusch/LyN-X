@@ -419,7 +419,12 @@ resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv) {
         if (DEBUG_VAR && node) console.error(`[OBJ_MAP] Invalid node for object map: ${node.type}, computed=${node && node.computed}`);
         return null;
     }
-    const entries = this.resolveObjectEntriesFromNode(node.object, scope, pos, overrides, runtimeEnv);
+    let entries = this.resolveObjectEntriesFromNode(node.object, scope, pos, overrides, runtimeEnv);
+    // The initializer literal is not the whole object: also merge entries the binding accrues via obj[k]=v
+    // assignment sequences, Object.assign, and object spread, so an imperatively-built or merged map becomes
+    // enumerable for the widening below. Sound (each entry is a possible endpoint); contained to this site.
+    const built = this.collectBuilderEntries(node.object, scope, pos, overrides, runtimeEnv);
+    if (built.length) entries = entries.concat(built);
     if (!entries.length) {
         if (DEBUG_VAR) console.error(`[OBJ_MAP] No entries found in object`);
         return null;
@@ -463,6 +468,59 @@ resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv) {
     }
     if (DEBUG_VAR) console.error(`[OBJ_MAP] Final result: ${resolved.length} values resolved`);
     return resolved.length ? [...new Set(resolved)] : null;
+}
+,
+
+// Gather {key, valueNode} entries a map binding accrues BEYOND its initializer literal — the flow-merged
+// object model. Three sources, all sound for literal contributors:
+//   (1) obj[k]=v / obj.k=v assignment sequences  (indexed in this.memberAssignments; computed-dynamic writes
+//       are recorded under the bare "obj." key, see indexing.js)
+//   (2) Object.assign(tgt, {..}, {..})           (merge each object-literal arg)
+//   (3) object spread  {...a, ...b, k:v}         (merge the spread arguments' entries)
+// Only the identifier-object case is handled (the overwhelmingly common shape); returns [] otherwise.
+collectBuilderEntries(objNode, scope, pos, overrides, runtimeEnv, _depth) {
+    if (!objNode || (_depth || 0) > 4) return [];
+    const out = [];
+    // (1) imperative property assignments, scope-filtered like resolveMemberAssignment
+    if (objNode.type === "Identifier" && this.memberAssignments) {
+        const name = objNode.name;
+        const rScopeId = this.bindingScopeId(scope, name, pos);
+        let synth = 0;
+        for (const [key, recs] of this.memberAssignments) {
+            if (key.length < name.length + 1 || key.slice(0, name.length + 1) !== name + ".") continue;
+            const prop = key.slice(name.length + 1);       // "" for computed-dynamic obj[expr]=v
+            for (const rec of recs) {
+                if (rec.base && this.bindingScopeId(rec.scope || scope, rec.base, rec.pos != null ? rec.pos : pos) !== rScopeId) continue;
+                const valueNode = rec.node || (rec.value != null ? { type: "Literal", value: rec.value } : null);
+                if (!valueNode) continue;
+                out.push({ key: prop || (" b" + synth++), valueNode });
+            }
+        }
+    }
+    // (2)+(3) trace the binding's initializer to Object.assign / spread and merge contributors
+    let valNode = objNode;
+    if (objNode.type === "Identifier") {
+        const found = this.findLatestDef(scope, objNode.name, pos);
+        const dn = found && found.def && found.def.node;
+        if (dn) valNode = dn.type === "VariableDeclarator" ? dn.init
+            : dn.type === "AssignmentExpression" ? dn.right : dn;
+    }
+    if (valNode && valNode.type === "CallExpression" && valNode.callee &&
+        valNode.callee.type === "MemberExpression" && this.getName(valNode.callee) === "Object.assign") {
+        for (const arg of valNode.arguments || []) {
+            this.resolveObjectEntriesFromNode(arg, scope, pos, overrides, runtimeEnv).forEach(e => out.push(e));
+            this.collectBuilderEntries(arg, scope, pos, overrides, runtimeEnv, (_depth || 0) + 1).forEach(e => out.push(e));
+        }
+    }
+    if (valNode && valNode.type === "ObjectExpression") {
+        for (const prop of valNode.properties || []) {
+            if (prop && prop.type === "SpreadElement" && prop.argument) {
+                this.resolveObjectEntriesFromNode(prop.argument, scope, pos, overrides, runtimeEnv).forEach(e => out.push(e));
+                this.collectBuilderEntries(prop.argument, scope, pos, overrides, runtimeEnv, (_depth || 0) + 1).forEach(e => out.push(e));
+            }
+        }
+    }
+    return out;
 }
 ,
 

@@ -617,7 +617,19 @@ index() {
                     console.error(`[INDEX] MEMBER_ASSIGN: ${memberKey} = ${JSON.stringify(value)}`);
                 }
             }
-            
+            // Computed-dynamic writes obj[expr]=v (propName==="") are skipped by the block above (its
+            // `&& propName` guard). Record them under the bare "obj." key (node only) so the flow-merged
+            // object model (collectBuilderEntries) can enumerate imperatively-built maps for widening. No
+            // resolver path reads a trailing-dot key otherwise, so this is inert to all other resolution.
+            else if (objName && node.left.computed && !propName && node.right) {
+                let baseNode = node.left;
+                while (baseNode && baseNode.type === "MemberExpression") baseNode = baseNode.object;
+                const base = baseNode && baseNode.type === "Identifier" ? baseNode.name : null;
+                const key = `${objName}.`;
+                if (!this.memberAssignments.has(key)) this.memberAssignments.set(key, []);
+                this.memberAssignments.get(key).push({ value: null, node: node.right, pos: node.start || 0, scope, base, global: !scope.parent });
+            }
+
             // Event handler assignment: element.onclick = function() { ... }
             if (this.isEventHandlerProperty(propName) && node.right &&
                 (node.right.type === "FunctionExpression" || node.right.type === "ArrowFunctionExpression")) {
