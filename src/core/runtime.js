@@ -1,5 +1,8 @@
 const { collectReturns } = require("./shared");   // the per-sink budget is this.opBudget (shared with resolve.js)
 
+// Array methods whose callback's FIRST param binds to an element — so a sink inside the callback iterates.
+const ITER_METHODS = new Set(["forEach", "map", "filter", "find", "findIndex", "some", "every", "flatMap"]);
+
 module.exports = {
 
 createRuntimeEnv() {
@@ -171,6 +174,14 @@ resolveExpressionRuntime(node, env, pos=0) {
                         }
                     });
                     if (resolved.length > 0) return [...new Set(resolved)];
+                    // Opaque index -> bounded union of ALL elements (mirrors static resolveComputedArrayWiden;
+                    // covers arr[i] evaluated inside an interpreted loop/branch body).
+                    if (elements.length) {
+                        const cap = Math.min(this.maxCombos || 8000, 512);
+                        const widened = [];
+                        for (const evs of elements) { for (const v of (evs || [])) { widened.push(v); if (widened.length >= cap) break; } if (widened.length >= cap) break; }
+                        if (widened.length) return [...new Set(widened)];
+                    }
                 }
             }
             // Handle inline ObjectExpression computed access: ({key:val,...})[param]
@@ -193,8 +204,8 @@ resolveExpressionRuntime(node, env, pos=0) {
                             }
                         });
                     });
-                    // If key is placeholder, return all values
-                    if (resolved.length === 0 && keyValues.some(v => typeof v === "string" && v.startsWith("{VAR:"))) {
+                    // If key is an opaque placeholder ({VAR:}/{CALL:}/...), return ALL values (bounded widening).
+                    if (resolved.length === 0 && keyValues.some(v => typeof v === "string" && /^\{[A-Z_]+:/.test(v))) {
                         entries.forEach(entry => {
                             this.resolveExpressionRuntime(entry.valueNode, env, pos)
                                 .forEach(val => resolved.push(val));
@@ -726,6 +737,8 @@ evalStatementRuntime(stmt, env) {
         if (!loopVar) return [env];
         const elements = this.resolveArrayElementsFromRuntime(stmt.right, env);
         if (!elements.length) return [env];
+        // Sequential unroll (u = each element in turn) so ACCUMULATIONS in the body build up correctly, e.g.
+        // `pathString += "/" + segment` -> base/a/b/c rather than three separate base/a, base/b, base/c.
         let envs = [env];
         for (const elementValues of elements) {
             if (this._budgetHit) break;   // op-budget exhausted — stop unrolling
@@ -740,6 +753,13 @@ evalStatementRuntime(stmt, env) {
             });
             envs = this.mergeRuntimeEnvs(next);
         }
+        // After the loop the loop var holds only the LAST element, but a sink INSIDE the body (fetch(u),
+        // el.href = u) is resolved later against this merged env and must see EVERY element. Bind it to the
+        // union of all values — accumulations above are already computed, so this only affects reads of the
+        // loop var itself (fixes the old bug where such sinks resolved to just the last element).
+        const allVals = [];
+        for (const ev of elements) for (const v of ev) allVals.push(v);
+        if (allVals.length) for (const e of envs) this.setRuntimeVar(e, loopVar, allVals, "=");
         return envs;
     }
 
@@ -912,11 +932,39 @@ evalBlockRuntime(statements, env) {
 getRuntimeEnvForFunction(fnNode) {
     if (!fnNode) return null;
     if (this.runtimeEnvCache.has(fnNode)) return this.runtimeEnvCache.get(fnNode);
+    const initEnv = this.createRuntimeEnv();
+    this.bindIterationCallbackParams(fnNode, initEnv);   // arr.forEach(u => ...) etc.: seed the element param
     const bodyStmts = fnNode.body && fnNode.body.type === "BlockStatement" ? fnNode.body.body : [fnNode.body];
-    const envs = this.evalBlockRuntime(bodyStmts.filter(Boolean), this.createRuntimeEnv());
+    const envs = this.evalBlockRuntime(bodyStmts.filter(Boolean), initEnv);
     const merged = this.mergeAllRuntimeEnvs(envs);
     this.runtimeEnvCache.set(fnNode, merged);
     return merged;
+}
+,
+
+// If fnNode is the callback of arr.forEach/map/filter/... (arr.method(fnNode)), bind its FIRST param to the
+// UNION of arr's element values so a sink in the body (fetch(u), el.href = u) resolves through it — the same
+// over-approximation as the for-of unroll, but for the array-method callback form (which the interpreter
+// otherwise never enters, leaving the element param unbound -> {VAR:u}).
+bindIterationCallbackParams(fnNode, env) {
+    const parent = this.parentMap.get(fnNode);
+    if (!parent || parent.type !== "CallExpression" || parent.arguments[0] !== fnNode) return;
+    const callee = parent.callee;
+    if (!callee || callee.type !== "MemberExpression" || callee.computed) return;
+    const method = callee.property && callee.property.type === "Identifier" ? callee.property.name : "";
+    if (!ITER_METHODS.has(method)) return;
+    const params = fnNode.params || [];
+    if (!params.length || params[0].type !== "Identifier") return;
+    if (!this._iterBind) this._iterBind = new Set();
+    if (this._iterBind.has(fnNode)) return;              // guard re-entry (nested/cyclic callbacks)
+    this._iterBind.add(fnNode);
+    try {
+        const outerEnv = this.getRuntimeEnvForNodeChain(parent);   // env at the call site (where arr is defined)
+        const elements = this.resolveArrayElementsFromRuntime(callee.object, outerEnv);
+        const allVals = [];
+        for (const ev of elements) for (const v of ev) allVals.push(v);
+        if (allVals.length) this.setRuntimeVar(env, params[0].name, allVals, "=");
+    } finally { this._iterBind.delete(fnNode); }
 }
 ,
 

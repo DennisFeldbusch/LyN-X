@@ -617,7 +617,19 @@ index() {
                     console.error(`[INDEX] MEMBER_ASSIGN: ${memberKey} = ${JSON.stringify(value)}`);
                 }
             }
-            
+            // Computed-dynamic writes obj[expr]=v (propName==="") are skipped by the block above (its
+            // `&& propName` guard). Record them under the bare "obj." key (node only) so the flow-merged
+            // object model (collectBuilderEntries) can enumerate imperatively-built maps for widening. No
+            // resolver path reads a trailing-dot key otherwise, so this is inert to all other resolution.
+            else if (objName && node.left.computed && !propName && node.right) {
+                let baseNode = node.left;
+                while (baseNode && baseNode.type === "MemberExpression") baseNode = baseNode.object;
+                const base = baseNode && baseNode.type === "Identifier" ? baseNode.name : null;
+                const key = `${objName}.`;
+                if (!this.memberAssignments.has(key)) this.memberAssignments.set(key, []);
+                this.memberAssignments.get(key).push({ value: null, node: node.right, pos: node.start || 0, scope, base, global: !scope.parent });
+            }
+
             // Event handler assignment: element.onclick = function() { ... }
             if (this.isEventHandlerProperty(propName) && node.right &&
                 (node.right.type === "FunctionExpression" || node.right.type === "ArrowFunctionExpression")) {
@@ -747,16 +759,18 @@ index() {
                 if (propName === "setAttribute" && objName) {
                     const attrNode = node.arguments && node.arguments[0];
                     const valueNode = node.arguments && node.arguments[1];
-                    if (attrNode && attrNode.type === "Literal" && (attrNode.value === "src" || attrNode.value === "href")) {
+                    if (attrNode && attrNode.type === "Literal" && (attrNode.value === "src" || attrNode.value === "href") && valueNode) {
+                        // el.setAttribute("src"/"href", url) is a URL sink just like el.src = url. Use the element
+                        // kind when known (script/link/img/...); otherwise fall back to the attribute name, so a
+                        // setAttribute on a createElement(<variable-tag>) element (the GTM/pixel-loader idiom,
+                        // whose tag lynx can't statically resolve) is still recorded — matching the direct-.src path.
                         const kind = this.elementKinds.get(objName);
-                        if (kind && valueNode) {
-                            this.addElementUrl(objName, { node: valueNode, scope, pos: node.start || 0 });
-                            this.sinks.push({
-                                node,
-                                scope,
-                                sinkInfo: { name: kind, urlNode: valueNode }
-                            });
-                        }
+                        if (kind) this.addElementUrl(objName, { node: valueNode, scope, pos: node.start || 0 });
+                        this.sinks.push({
+                            node,
+                            scope,
+                            sinkInfo: { name: kind || String(attrNode.value), urlNode: valueNode }
+                        });
                     }
                 }
                 if (propName === "appendChild" || propName === "append" || propName === "insertBefore") {

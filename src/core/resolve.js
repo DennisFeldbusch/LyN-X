@@ -3,7 +3,7 @@ const DEBUG_VAR = process.env.DEBUG_VAR === '1';
 
 // The per-sink resolver budget is this.opBudget (set from core/shared.js in the LyNX ctor, CLI-overridable);
 // collectReturns is shared with runtime.js. LEN_CHARGE_FLOOR gates the length surcharge in deduplicateAndCap.
-const { collectReturns, LEN_CHARGE_FLOOR } = require("./shared");
+const { collectReturns, LEN_CHARGE_FLOOR, ARITY_CAP } = require("./shared");
 
 // Known functions that return URLs or URL-like values
 const URL_RETURNING_FUNCTIONS = {
@@ -121,8 +121,13 @@ resolveIdentifier(name, scope, pos, overrides, runtimeEnv) {
     }
     
     if (scope && scope.paramNames && scope.paramNames.has(name)) {
-        if (DEBUG_VAR) console.error(`[RESOLVE] PARAM: ${name} (scope ${scopeId})`);
-        return [`{VAR:${name}}`];
+        // Params are substituted via overrides (checked above); an unbound one is {VAR:name} — UNLESS the
+        // runtime env bound it (an arr.forEach(u => ...) / .map element param, or a param reassigned in the
+        // body), in which case fall through to the runtimeEnv block below to use those values.
+        if (!(runtimeEnv && runtimeEnv.values.has(name))) {
+            if (DEBUG_VAR) console.error(`[RESOLVE] PARAM: ${name} (scope ${scopeId})`);
+            return [`{VAR:${name}}`];
+        }
     }
     if (runtimeEnv && runtimeEnv.values.has(name)) {
         const vals = [...runtimeEnv.values.get(name)];
@@ -414,7 +419,12 @@ resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv) {
         if (DEBUG_VAR && node) console.error(`[OBJ_MAP] Invalid node for object map: ${node.type}, computed=${node && node.computed}`);
         return null;
     }
-    const entries = this.resolveObjectEntriesFromNode(node.object, scope, pos, overrides, runtimeEnv);
+    let entries = this.resolveObjectEntriesFromNode(node.object, scope, pos, overrides, runtimeEnv);
+    // The initializer literal is not the whole object: also merge entries the binding accrues via obj[k]=v
+    // assignment sequences, Object.assign, and object spread, so an imperatively-built or merged map becomes
+    // enumerable for the widening below. Sound (each entry is a possible endpoint); contained to this site.
+    const built = this.collectBuilderEntries(node.object, scope, pos, overrides, runtimeEnv);
+    if (built.length) entries = entries.concat(built);
     if (!entries.length) {
         if (DEBUG_VAR) console.error(`[OBJ_MAP] No entries found in object`);
         return null;
@@ -432,7 +442,10 @@ resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv) {
             }
         });
     });
-    if (resolved.length === 0 && keyValues.some(val => typeof val === "string" && val.startsWith("{VAR:"))) {
+    // Opaque key (any {VAR:}/{CALL:}/{URL_CALL:} placeholder) that matched no entry -> widen to the union of
+    // ALL values. Each is a possible endpoint (sound over-approximation); was previously {VAR:}-only, which
+    // missed obj[fn()] / obj[cond?a:b] etc.
+    if (resolved.length === 0 && keyValues.some(val => typeof val === "string" && /^\{[A-Z_]+:/.test(val))) {
         if (DEBUG_VAR) console.error(`[OBJ_MAP] Key is unresolved, returning all values`);
         entries.forEach(entry => {
             this.resolveExpression(entry.valueNode, scope, pos, overrides, runtimeEnv)
@@ -458,6 +471,59 @@ resolveMemberFromObjectMap(node, scope, pos, overrides, runtimeEnv) {
 }
 ,
 
+// Gather {key, valueNode} entries a map binding accrues BEYOND its initializer literal — the flow-merged
+// object model. Three sources, all sound for literal contributors:
+//   (1) obj[k]=v / obj.k=v assignment sequences  (indexed in this.memberAssignments; computed-dynamic writes
+//       are recorded under the bare "obj." key, see indexing.js)
+//   (2) Object.assign(tgt, {..}, {..})           (merge each object-literal arg)
+//   (3) object spread  {...a, ...b, k:v}         (merge the spread arguments' entries)
+// Only the identifier-object case is handled (the overwhelmingly common shape); returns [] otherwise.
+collectBuilderEntries(objNode, scope, pos, overrides, runtimeEnv, _depth) {
+    if (!objNode || (_depth || 0) > 4) return [];
+    const out = [];
+    // (1) imperative property assignments, scope-filtered like resolveMemberAssignment
+    if (objNode.type === "Identifier" && this.memberAssignments) {
+        const name = objNode.name;
+        const rScopeId = this.bindingScopeId(scope, name, pos);
+        let synth = 0;
+        for (const [key, recs] of this.memberAssignments) {
+            if (key.length < name.length + 1 || key.slice(0, name.length + 1) !== name + ".") continue;
+            const prop = key.slice(name.length + 1);       // "" for computed-dynamic obj[expr]=v
+            for (const rec of recs) {
+                if (rec.base && this.bindingScopeId(rec.scope || scope, rec.base, rec.pos != null ? rec.pos : pos) !== rScopeId) continue;
+                const valueNode = rec.node || (rec.value != null ? { type: "Literal", value: rec.value } : null);
+                if (!valueNode) continue;
+                out.push({ key: prop || (" b" + synth++), valueNode });
+            }
+        }
+    }
+    // (2)+(3) trace the binding's initializer to Object.assign / spread and merge contributors
+    let valNode = objNode;
+    if (objNode.type === "Identifier") {
+        const found = this.findLatestDef(scope, objNode.name, pos);
+        const dn = found && found.def && found.def.node;
+        if (dn) valNode = dn.type === "VariableDeclarator" ? dn.init
+            : dn.type === "AssignmentExpression" ? dn.right : dn;
+    }
+    if (valNode && valNode.type === "CallExpression" && valNode.callee &&
+        valNode.callee.type === "MemberExpression" && this.getName(valNode.callee) === "Object.assign") {
+        for (const arg of valNode.arguments || []) {
+            this.resolveObjectEntriesFromNode(arg, scope, pos, overrides, runtimeEnv).forEach(e => out.push(e));
+            this.collectBuilderEntries(arg, scope, pos, overrides, runtimeEnv, (_depth || 0) + 1).forEach(e => out.push(e));
+        }
+    }
+    if (valNode && valNode.type === "ObjectExpression") {
+        for (const prop of valNode.properties || []) {
+            if (prop && prop.type === "SpreadElement" && prop.argument) {
+                this.resolveObjectEntriesFromNode(prop.argument, scope, pos, overrides, runtimeEnv).forEach(e => out.push(e));
+                this.collectBuilderEntries(prop.argument, scope, pos, overrides, runtimeEnv, (_depth || 0) + 1).forEach(e => out.push(e));
+            }
+        }
+    }
+    return out;
+}
+,
+
 resolveArrayElementsFromNode(node, scope, pos, overrides, runtimeEnv) {
     if (!node) return [];
     if (node.type === "ArrayExpression") {
@@ -470,6 +536,37 @@ resolveArrayElementsFromNode(node, scope, pos, overrides, runtimeEnv) {
         }
     }
     return [];
+}
+,
+
+// Computed array/list access `arr[i]` where `arr` is (or resolves to) an array literal. A concrete index
+// yields that element; an OPAQUE index widens to the BOUNDED union of every entry. This is a sound
+// over-approximation for URL extraction: each entry is an endpoint the script may load, so we emit the whole
+// set rather than a bare {VAR:i} placeholder — recovering manifest/chunk-list/route-table lookups that regex
+// greps as literals but backward taint otherwise loses at the indexing step. (Object-literal maps `obj[k]`
+// are handled by resolveMemberFromObjectMap, which already widens on an unresolved key.) Bounded by maxCombos
+// (capped) so a large data array can't explode output; non-URL entries are dropped later at emission.
+resolveComputedArrayWiden(node, scope, pos, overrides, runtimeEnv) {
+    if (!node || node.type !== "MemberExpression" || !node.computed) return null;
+    const elemLists = this.resolveArrayElementsFromNode(node.object, scope, pos, overrides, runtimeEnv);
+    if (!elemLists.length) return null;                        // not an array literal (objects handled elsewhere)
+    // Concrete integer index -> that element only (precise, no widening).
+    const idxVals = this.resolveExpression(node.property, scope, pos, overrides, runtimeEnv);
+    const concrete = [];
+    for (const iv of idxVals) {
+        const n = typeof iv === "number" ? iv
+            : (typeof iv === "string" && /^\d+$/.test(iv.trim()) ? parseInt(iv, 10) : null);
+        if (n != null && n >= 0 && n < elemLists.length && elemLists[n]) elemLists[n].forEach(v => concrete.push(v));
+    }
+    if (concrete.length) return this.deduplicateAndCap(concrete);
+    // Opaque index -> bounded widening over ALL entries.
+    const cap = Math.min(this.maxCombos || 8000, 512);
+    const out = [];
+    for (const evs of elemLists) {
+        for (const v of evs) { out.push(v); if (out.length >= cap) break; }
+        if (out.length >= cap) break;
+    }
+    return out.length ? this.deduplicateAndCap(out) : null;
 }
 ,
 
@@ -501,6 +598,17 @@ getSinkArgumentNode(node, sinkInfo, scope, pos) {
 
 buildQueryStrings(entries) {
     if (!entries || entries.length === 0) return [""];
+    // Semantic collapse: a maximal RUN of query params with an identical (keys, values) signature is the
+    // tool eagerly enumerating a repeated `&k=v` pattern — e.g. N copies of `&lbid=(getAttr()|null)` — whose
+    // cartesian product blows up to 2^N genuinely-distinct strings that exact-string dedup can't merge.
+    // Repeated identical params add no endpoint structure, so fold each run to ONE entry. Distinct repeated
+    // keys (`?id=1&id=2`) have different value signatures and survive.
+    if (entries.length > 2) {
+        const sig = (e) => JSON.stringify([e.keyValues, e.valueValues]);
+        const folded = []; let prev = null;
+        for (const e of entries) { const s = sig(e); if (s === prev) continue; prev = s; folded.push(e); }
+        entries = folded;
+    }
     const cap = this.maxCombos || 8000;
     let combos = [""];
     entries.forEach(entry => {
@@ -509,20 +617,26 @@ buildQueryStrings(entries) {
         // whose key/value resolved to many candidates makes either explode, and the old code built the
         // FULL product before capping — seconds of wasted string work per sink. Cap both at `cap` (the
         // result is deduped/capped to maxCombos anyway) so a single call stays O(cap), not O(product).
-        const pairs = [];
+        const pairs = [], pairAr = [];
         for (const k of entry.keyValues) {
             if (pairs.length >= cap) break;
             for (const v of entry.valueValues) {
                 if (pairs.length >= cap) break;
                 pairs.push(`${k}=${v}`);
+                if (this._arity) pairAr.push(this._arity.get(v) || 1);   // this param counts pieces(v)
             }
         }
         const next = [];
         for (const prefix of combos) {
             if (next.length >= cap) break;
-            for (const pair of pairs) {
+            for (let pi = 0; pi < pairs.length; pi++) {
                 if (next.length >= cap) break;
-                next.push(prefix ? `${prefix}&${pair}` : pair);
+                const s = prefix ? `${prefix}&${pairs[pi]}` : pairs[pi];
+                if (this._arity) {
+                    const a = Math.min(ARITY_CAP, (prefix ? (this._arity.get(prefix) || 1) : 0) + pairAr[pi]);
+                    if (a > (this._arity.get(s) || 0)) this._arity.set(s, a);
+                }
+                next.push(s);
             }
         }
         combos = this.deduplicateAndCap(next);
@@ -1313,7 +1427,11 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
             };
             collectBranches(node.consequent);
             collectBranches(node.alternate);
-            return this.deduplicateAndCap(allBranches.filter(v => v !== ""));
+            // Keep "" branches: a ternary like `cond ? "-uat" : ""` inside a concatenation has a REAL
+            // empty branch (here the prod host `cale.advance.net` vs UAT `cale-uat.advance.net`). Pruning
+            // it here drops a constructible host (soundness bug). Bare empty results are still dropped at
+            // emission (analyze.js: `if (!val) return`), so this only affects concat context.
+            return this.deduplicateAndCap(allBranches);
         }
         case "LogicalExpression": {
             const left = this.resolveExpression(node.left, scope, pos, overrides, runtimeEnv);
@@ -1333,6 +1451,15 @@ _resolveExpressionInner(node, scope, pos, overrides, runtimeEnv) {
                     console.error(`[RESOLVE] MEMBER_MAP: ${name} = ${mapResolved.join(", ")}`);
                 }
                 return mapResolved;
+            }
+            // Computed array/list index arr[i]: concrete element, or bounded union of all entries when the
+            // index is opaque (sound over-approximation — every entry is a possible endpoint).
+            if (node.computed) {
+                const arrWiden = this.resolveComputedArrayWiden(node, scope, pos, overrides, runtimeEnv);
+                if (arrWiden && arrWiden.length) {
+                    if (DEBUG_VAR) console.error(`[RESOLVE] ARRAY_WIDEN: ${this.getName(node)} = ${arrWiden.length} entries`);
+                    return arrWiden;
+                }
             }
             if (node.object && node.object.type === "NewExpression") {
                 const calleeName = this.getName(node.object.callee);

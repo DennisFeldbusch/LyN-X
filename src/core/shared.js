@@ -25,6 +25,18 @@ const INDEX_BUDGET = process.env.LYNX_INDEX_BUDGET !== undefined ? +process.env.
 // resolver tuning knob that isn't a budget — kept here so all limits live in one place.
 const MAX_COMBOS = 8000;
 
+// Per-sink over-generation guard (analyze.js emit): at most this many emitted URLs may share one STRUCTURAL
+// key (same base + distinct query keys). Optional-append chains (`M && (i.src += "&lbid=" + M)` x N) resolve
+// to 2^N same-structure strings; this caps them to a few representatives. Well above real path-sensitive
+// variety per sink, so normal output is unaffected. Env-overridable via LYNX_MAX_VARIANTS; 0 disables.
+const MAX_VARIANTS_PER_STRUCT = process.env.LYNX_MAX_VARIANTS !== undefined ? +process.env.LYNX_MAX_VARIANTS : 8;
+
+// Construction-arity cap (research tracking only). A string built in a loop/branch-fan-out is RE-DERIVED
+// through many cartesian paths, and taking the max piece-count over all of them compounds without bound
+// (self-concat `x+x` doubles each pass). Clamp so a heavily-constructed URL saturates here instead of
+// reaching astronomical values; the informative 1..~10 range for normal URLs is unaffected.
+const ARITY_CAP = 64;
+
 // Candidate-string length limits, shared by cartesianConcat (analyze.js) and deduplicateAndCap (resolve.js).
 // MAX_VALUE_LEN: past this a string is a runaway concat, not a URL — dropped. LEN_CHARGE_FLOOR: above this,
 // string ops charge the op-budget proportional to length (build + Set-hash + StringEqual scale with length),
@@ -62,4 +74,4 @@ function collectReturns(node) {
     return returns;
 }
 
-module.exports = { OP_BUDGET, TOTAL_BUDGET, INDEX_BUDGET, MAX_COMBOS, MAX_VALUE_LEN, LEN_CHARGE_FLOOR, collectReturns };
+module.exports = { OP_BUDGET, TOTAL_BUDGET, INDEX_BUDGET, MAX_COMBOS, MAX_VARIANTS_PER_STRUCT, ARITY_CAP, MAX_VALUE_LEN, LEN_CHARGE_FLOOR, collectReturns };
