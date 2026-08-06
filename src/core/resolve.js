@@ -331,6 +331,39 @@ _findObjectExprNode(node, scope, pos) {
         if (DEBUG_VAR) console.error(`[OBJECT] Direct ObjectExpression found`);
         return { objectNode: node, defScope: scope, defPos: pos };
     }
+    // A call that RETURNS an object literal: `g.urls = build(opts); g.urls.events` — trace into the callee's
+    // return so member access reaches the returned object's properties (and their `||`/`?:` defaults). Bounded
+    // by the _foenDepth cap above and the op-budget; falls through to null if the return isn't object-shaped.
+    if (node.type === "CallExpression") {
+        const fnNode = this.resolveCalledFunctionNode({ node, scope });
+        if (!fnNode) return null;
+        // The returned object literal is the SAME AST node for every call site (param bindings are applied
+        // later, when property values are resolved), so memoize per function: collectReturns + the recursive
+        // trace run at most ONCE per function, bounding total work to O(file) instead of O(call-sites × body).
+        // The in-progress set cuts cyclic returns (f -> g() -> f()) that the depth cap alone would let re-walk.
+        if (!this._fnRetObjMemo) { this._fnRetObjMemo = new Map(); this._fnRetObjInProgress = new Set(); }
+        if (this._fnRetObjMemo.has(fnNode)) return this._fnRetObjMemo.get(fnNode);
+        if (this._fnRetObjInProgress.has(fnNode)) return null;                 // cycle -> unresolved
+        this._fnRetObjInProgress.add(fnNode);
+        const fnScope = this.fnScopeMap.get(fnNode) || scope;
+        // Charge the op-budget for the (otherwise uncharged) collectReturns body walk, proportional to the
+        // function's source span (~1 op / 64 chars). With the memo this is paid once per function, but the
+        // charge also bounds the un-memoized worst case: a deep/cyclic chain trips _budgetHit and bails.
+        this._ops = (this._ops || 0) + 1 + (Math.max(0, (fnNode.end || 0) - (fnNode.start || 0)) >> 6);
+        if (this.opBudget && this._ops > this.opBudget) { this._budgetHit = true; this._fnRetObjInProgress.delete(fnNode); return null; }
+        const returns = [];
+        if (fnNode.type === "ArrowFunctionExpression" && fnNode.body && fnNode.body.type !== "BlockStatement") returns.push(fnNode.body);
+        else returns.push(...collectReturns(fnNode.body || fnNode));
+        let result = null;
+        for (const ret of returns) {
+            if (this._budgetHit) break;
+            const oi = this._findObjectExprNode(ret, fnScope, ret && ret.start ? ret.start : pos);
+            if (oi) { result = oi; break; }
+        }
+        this._fnRetObjInProgress.delete(fnNode);
+        if (!this._budgetHit) this._fnRetObjMemo.set(fnNode, result);          // don't cache a budget-bail null (retryable per-sink)
+        return result;
+    }
     if (node.type === "ThisExpression") {
         if (DEBUG_VAR) console.error(`[OBJECT] ThisExpression - looking for class definition`);
         // For 'this', we'd need to find the class/constructor context
@@ -358,8 +391,8 @@ _findObjectExprNode(node, scope, pos) {
             if (initType === "ObjectExpression") {
                 return { objectNode: found.def.node.init, defScope: found.scope, defPos: found.def.pos };
             }
-            if (initType === "Identifier") {
-                // Recursively resolve the identifier that it's initialized from
+            if (initType === "Identifier" || initType === "CallExpression" || initType === "MemberExpression") {
+                // Recurse: aliased var, a call returning an object, or another object's property.
                 return this._findObjectExprNode(found.def.node.init, found.scope, found.def.pos);
             }
         }
@@ -371,11 +404,17 @@ _findObjectExprNode(node, scope, pos) {
             if (rhsType === "ObjectExpression") {
                 return { objectNode: found.def.node.right, defScope: found.scope, defPos: found.def.pos };
             }
-            if (rhsType === "Identifier") {
+            if (rhsType === "Identifier" || rhsType === "CallExpression" || rhsType === "MemberExpression") {
                 return this._findObjectExprNode(found.def.node.right, found.scope, found.def.pos);
             }
         }
         
+        // The def may be stored as the init/rhs node DIRECTLY (e.g. `const cfg = build(...)` -> def.node is the
+        // CallExpression itself, not a VariableDeclarator). Recurse so a call returning an object, or an aliased
+        // member, resolves — this closes the 2-level `cfg = build(); cfg.events` case.
+        if (found.def.node && (found.def.node.type === "CallExpression" || found.def.node.type === "MemberExpression")) {
+            return this._findObjectExprNode(found.def.node, found.scope, found.def.pos);
+        }
         if (DEBUG_VAR) console.error(`[OBJECT] Definition node type not ObjectExpression: ${found.def.node ? found.def.node.type : 'unknown'}`);
         return null;
     }
